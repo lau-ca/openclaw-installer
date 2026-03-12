@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+@theme {
+  /* OpenClaw Light Theme */
+  --color-background: #ffffff;
+  --color-foreground: #1e1918;
+  --color-card: #ffffff;
+  --color-card-foreground: #1e1918;
+  --color-primary: #ff5a36;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #f4f4f5;
+  --color-secondary-foreground: #777271;
+  --color-muted: #f4f4f5;
+  --color-muted-foreground: #777271;
+  --color-accent: #ff5a36;
+  --color-accent-foreground: #ffffff;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+  --color-border: #e6e6e6;
+  --color-input: #e6e6e6;
+  --color-ring: #ff5a36;
+  --color-success: #22c55e;
+  --color-warning: #eab308;
+  --radius: 1rem;
+
+  --font-sans: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Fragment Mono", "JetBrains Mono", monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans selection:bg-primary/20 selection:text-primary;
+  }
+}
+
+/* Light clean card interaction instead of glassmorphism */
+.glass {
+  background: #ffffff;
+  border: 1px solid #e6e6e6;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+/* Simplified glow map to primary color */
+.glow-blue {
+  box-shadow: 0 0 0 1px #ff5a36, 0 4px 14px 0 rgba(255, 90, 54, 0.15);
+  border-color: #ff5a36 !important;
+}
+
+/* Pulse dot animation */
+@keyframes pulse-dot {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.animate-pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* Vertical scroll fade mask */
+.scroll-mask-y {
+  /* 增加遮罩的羽化区域体验柔和过渡，顶部和底部各留出 16px 的渐变 */
+  mask-image: linear-gradient(to bottom, transparent 0%, black 16px, black calc(100% - 16px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 16px, black calc(100% - 16px), transparent 100%);
+}
