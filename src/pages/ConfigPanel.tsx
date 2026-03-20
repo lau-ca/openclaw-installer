@@ -1,6 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,6 +10,7 @@ import { Select } from "@/components/ui/select";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import type { ResourceWithId } from "@/lib/db";
+import { resourceArgs } from "@/lib/tauri";
 import {
   Loader2,
   Save,
@@ -201,6 +204,12 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
   const [saveMsg, setSaveMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("basic");
 
+  // ── 部署日志弹窗 ──────────────────────────────
+  const [deployLogs, setDeployLogs] = useState<string[]>([]);
+  const [deployOpen, setDeployOpen] = useState(false);
+  const [deployStatus, setDeployStatus] = useState<"running" | "success" | "error">("running");
+  const deployLogEndRef = useRef<HTMLDivElement>(null);
+
   // ── 基本配置 tab state ─────────────────────────
   const [gatewayPort, setGatewayPort] = useState("18789");
   const [gwBind, setGwBind] = useState("loopback");
@@ -266,6 +275,9 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
   const [consoleLevel, setConsoleLevel] = useState("info");
   const [redactSensitive, setRedactSensitive] = useState("tools");
 
+  // 记录从服务端加载的 provider IDs，用于保存时清理已删除的 provider
+  const loadedProviderIds = useRef<string[]>([]);
+
   // ── Load config ────────────────────────────────
 
   const loadConfig = useCallback(async () => {
@@ -273,12 +285,8 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
     setLoading(true);
     try {
       const raw = await invoke<string>("read_openclaw_config", {
-        target: resource.type,
-        host: resource.host ?? null,
-        port: resource.port ?? null,
-        username: resource.username ?? null,
-        password: resource.password ?? null,
-        config_path: configPath ?? undefined,
+        ...resourceArgs(resource),
+        configPath: configPath ?? undefined,
       });
       const parsed: AnyConfig = JSON.parse(raw);
 
@@ -291,9 +299,28 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
       setGwMode(gw.mode || "local");
       setGatewayPort(String(gw.port ?? 18789));
 
-      // bind: 有值用实际值；未设置时远程默认 lan，本机默认 loopback
-      const bindHasValue = gw.bind !== undefined && gw.bind !== null;
-      setGwBind(bindHasValue ? gw.bind : (isRemoteRes ? "lan" : "loopback"));
+      // bind / HTTPS 代理 / 认证模式
+      if (isRemoteRes) {
+        // 远程 Linux：lan + HTTPS 代理 + token 认证（Caddy 仅做 TLS 终止）
+        setGwBind("lan");
+        setHttpsProxyEnabled(true);
+        // 使用服务端实际值，默认 token（避免 trusted-proxy 导致 sessions_spawn unauthorized）
+        const remoteAuthMode = gwAuth.mode || "token";
+        setGwAuthMode(remoteAuthMode);
+      } else {
+        // 本机：有值用实际值，未设置时默认 loopback
+        const bindHasValue = gw.bind !== undefined && gw.bind !== null;
+        setGwBind(bindHasValue ? gw.bind : "loopback");
+
+        const authModeHasValue = gwAuth.mode !== undefined && gwAuth.mode !== null;
+        if (authModeHasValue) {
+          setGwAuthMode(gwAuth.mode);
+          setHttpsProxyEnabled(gwAuth.mode === "trusted-proxy");
+        } else {
+          setGwAuthMode("token");
+          setHttpsProxyEnabled(false);
+        }
+      }
 
       setGwAuthToken(gwAuth.token || "");
       setWorkspace(parsed.agents?.defaults?.workspace || "~/.openclaw/workspace");
@@ -301,25 +328,6 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
       setTimeFormat(parsed.agents?.defaults?.timeFormat || "auto");
       setGwControlUi(gwCui.enabled !== false);
       setGwControlUiBasePath(gwCui.basePath || "/openclaw");
-
-      // HTTPS 代理 & 认证模式 —— 读取实际配置
-      const authModeHasValue = gwAuth.mode !== undefined && gwAuth.mode !== null;
-      const isTrustedProxy = gwAuth.mode === "trusted-proxy";
-
-      if (authModeHasValue) {
-        // 用户已配置过认证模式 → 原样展示
-        setGwAuthMode(gwAuth.mode);
-        setHttpsProxyEnabled(isTrustedProxy);
-      } else {
-        // 首次（未配置）→ 远程默认开启 HTTPS 代理 + trusted-proxy；本机默认 token
-        if (isRemoteRes) {
-          setGwAuthMode("trusted-proxy");
-          setHttpsProxyEnabled(true);
-        } else {
-          setGwAuthMode("token");
-          setHttpsProxyEnabled(false);
-        }
-      }
 
       // 从 allowedOrigins 中提取 HTTPS 端口
       const origins: string[] = gwCui.allowedOrigins || [];
@@ -345,6 +353,7 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
       }
       setEnvKeys(rawEnv);
       const rawProviders: Record<string, ProviderConfig> = parsed.models?.providers ?? {};
+      loadedProviderIds.current = Object.keys(rawProviders);
       setProviders(
         Object.entries(rawProviders).map(([id, cfg]) => ({
           id,
@@ -407,14 +416,14 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
     } finally {
       setLoading(false);
     }
-  }, [resource, onConfigChange]);
+  }, [resource, onConfigChange, configPath]);
 
   useEffect(() => { loadConfig(); }, [loadConfig]);
 
   // 本机 + 非 loopback 时自动检测局域网 IP
   useEffect(() => {
     if (!isRemote && gwBind !== "loopback" && !lanIp) {
-      invoke<string>("get_local_lan_ip").then(setLanIp).catch(() => {});
+      invoke<string>("get_local_lan_ip").then(setLanIp).catch(() => { });
     }
   }, [isRemote, gwBind, lanIp]);
 
@@ -440,7 +449,9 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
         gwAuthPatch.token = gwAuthToken;
       }
       if (gwAuthMode === "trusted-proxy") {
-        gwAuthPatch.trustedProxy = { userHeader: "x-forwarded-user" };
+        gwAuthPatch.trustedProxy = {
+          userHeader: "x-forwarded-user",
+        };
       }
 
       // 构建 allowedOrigins（所有非 loopback 场景都需要包含访问 IP）
@@ -464,12 +475,12 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
           port: gwPort,
           bind: gwBind,
           auth: gwAuthPatch,
-          // trusted-proxy 模式需要 trustedProxies（Caddy 从本机连接）
-          ...(gwAuthMode === "trusted-proxy" ? { trustedProxies: ["127.0.0.1"] } : {}),
+          // trusted-proxy 模式需要 trustedProxies（Caddy 从本机连接）；切换模式时显式清除
+          trustedProxies: gwAuthMode === "trusted-proxy" ? ["127.0.0.1"] : null,
           controlUi: {
             enabled: gwControlUi,
             basePath: gwControlUiBasePath,
-            ...(gwBind !== "loopback" ? { allowedOrigins } : {}),
+            allowedOrigins: gwBind !== "loopback" ? allowedOrigins : null,
           },
         },
         commands: {
@@ -478,26 +489,32 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
           ownerDisplay: cmdOwnerDisplay,
           restart: cmdRestart,
         },
-        // env keys for built-in providers
-        ...(Object.keys(envKeys).length > 0 ? {
-          env: Object.fromEntries(
-            Object.entries(envKeys).filter(([, v]) => v.length > 0),
-          ),
-        } : {}),
+        // env keys for built-in providers — 已清空的 key 显式设为 null 以通过 deep_merge 删除
+        env: Object.fromEntries(
+          BUILTIN_ENV_KEYS.map((def) => [def.key, envKeys[def.key] || null]),
+        ),
         models: {
           mode: modelsMode,
-          ...(Object.keys(providersMap).length > 0 ? { providers: providersMap } : {}),
+          providers: (() => {
+            // 将已删除的 provider 显式设为 null 以通过 deep_merge 从配置中移除
+            const merged: Record<string, ProviderConfig | null> = {};
+            for (const oldId of loadedProviderIds.current) {
+              if (!providersMap[oldId]) merged[oldId] = null;
+            }
+            Object.assign(merged, providersMap);
+            return merged;
+          })(),
         },
         agents: {
           defaults: {
             model: {
               primary: primaryModel,
-              ...(fallbackModels.length > 0 ? { fallbacks: fallbackModels } : {}),
+              fallbacks: fallbackModels.length > 0 ? fallbackModels : null,
             },
-            ...(imageModel ? { imageModel: { primary: imageModel } } : {}),
-            ...(pdfModel ? { pdfModel: { primary: pdfModel } } : {}),
+            imageModel: imageModel ? { primary: imageModel } : null,
+            pdfModel: pdfModel ? { primary: pdfModel } : null,
             workspace,
-            ...(userTimezone ? { userTimezone } : {}),
+            userTimezone: userTimezone || null,
             timeFormat,
             maxConcurrent: parseInt(maxConcurrent, 10) || 1,
             timeoutSeconds: parseInt(timeoutSeconds, 10) || 600,
@@ -508,53 +525,98 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
             contextTokens: parseInt(contextTokens, 10) || 200000,
             compaction: { mode: compactionMode },
           },
-          ...(identityName || identityTheme || identityEmoji ? {
-            list: [{
+          list: (identityName || identityTheme || identityEmoji)
+            ? [{
               id: "main",
               identity: {
-                ...(identityName ? { name: identityName } : {}),
-                ...(identityTheme ? { theme: identityTheme } : {}),
-                ...(identityEmoji ? { emoji: identityEmoji } : {}),
+                name: identityName || null,
+                theme: identityTheme || null,
+                emoji: identityEmoji || null,
               },
-            }],
-          } : {}),
+            }]
+            : null,
         },
-        ...(responsePrefix || ackReaction ? {
-          messages: {
-            ...(responsePrefix ? { responsePrefix } : {}),
-            ...(ackReaction ? { ackReaction } : {}),
-          },
-        } : {}),
+        messages: {
+          responsePrefix: responsePrefix || null,
+          ackReaction: ackReaction || null,
+        },
         session: {
           dmScope,
-          ...(resetMode ? {
-            reset: {
+          reset: resetMode
+            ? {
               mode: resetMode,
-              ...(resetMode === "daily" ? { atHour: parseInt(resetAtHour, 10) || 4 } : {}),
-              ...(resetMode === "idle" ? { idleMinutes: parseInt(resetIdleMinutes, 10) || 60 } : {}),
-            },
-          } : {}),
+              atHour: resetMode === "daily" ? (parseInt(resetAtHour, 10) || 4) : null,
+              idleMinutes: resetMode === "idle" ? (parseInt(resetIdleMinutes, 10) || 60) : null,
+            }
+            : null,
           resetTriggers,
         },
         logging: {
           level: logLevel,
-          ...(logFile ? { file: logFile } : {}),
+          file: logFile || null,
           consoleLevel,
           redactSensitive,
         },
       };
 
       await invoke("patch_openclaw_config", {
-        target: resource.type,
-        host: resource.host ?? null,
-        port: resource.port ?? null,
-        username: resource.username ?? null,
-        password: resource.password ?? null,
+        ...resourceArgs(resource),
         patch: JSON.stringify(patch),
-        config_path: configPath ?? undefined,
+        configPath: configPath ?? undefined,
       });
 
-      setSaveMsg({ type: "ok", text: "配置已保存" });
+      // 远程 Linux：先运行 setup-https.sh 配置 Caddy，再重启网关使配置生效
+      if (isRemote) {
+        // 打开日志弹窗并订阅 install:log 事件
+        setDeployLogs(["[1/3] 配置已保存"]);
+        setDeployStatus("running");
+        setDeployOpen(true);
+
+        const unlisten = await listen<{ line: string }>("install:log", (ev) => {
+          setDeployLogs((prev) => [...prev, ev.payload.line]);
+        });
+
+        try {
+          // Step 2: 配置 HTTPS 代理
+          setDeployLogs((prev) => [...prev, "[2/3] 正在配置 HTTPS 代理 (Caddy)..."]);
+          await invoke("setup_remote_https", {
+            host: resource?.host ?? "",
+            port: resource?.port ?? 22,
+            username: resource?.username ?? "",
+            password: resource?.password ?? "",
+            httpsPort: httpsProxyPort || "18790",
+          });
+
+          // Step 3: 重启网关使配置生效
+          setDeployLogs((prev) => [...prev, "[3/3] 正在重启网关使配置生效..."]);
+          await invoke("gateway_control", {
+            action: "restart",
+            ...resourceArgs(resource),
+          });
+
+          setDeployLogs((prev) => [...prev, "✅ 全部完成：配置已保存 → HTTPS 代理已配置 → 网关已重启"]);
+          setDeployStatus("success");
+          setSaveMsg({ type: "ok", text: "配置已保存并生效" });
+        } catch (err) {
+          setDeployLogs((prev) => [...prev, `❌ 失败: ${err}`]);
+          setDeployStatus("error");
+          setSaveMsg({ type: "err", text: `部署失败: ${err}` });
+        } finally {
+          unlisten();
+        }
+      } else {
+        // 本机安装：直接重启网关使配置生效
+        try {
+          await invoke("gateway_control", {
+            action: "restart",
+            ...resourceArgs(resource),
+          });
+          setSaveMsg({ type: "ok", text: "配置已保存并生效" });
+        } catch {
+          setSaveMsg({ type: "ok", text: "配置已保存（网关重启失败，请手动重启）" });
+        }
+      }
+
       await loadConfig();
     } catch (err) {
       setSaveMsg({ type: "err", text: `保存失败: ${err}` });
@@ -601,10 +663,14 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
     if (!modelId.trim()) return;
     setProviders((prev) => prev.map((p, i) => {
       if (i !== idx) return p;
-      return { ...p, config: { ...p.config, models: [...p.config.models, {
-        id: modelId.trim(), name: modelName.trim() || modelId.trim(),
-        reasoning: false, contextWindow: 128000, maxTokens: 8192,
-      }] } };
+      return {
+        ...p, config: {
+          ...p.config, models: [...p.config.models, {
+            id: modelId.trim(), name: modelName.trim() || modelId.trim(),
+            reasoning: false, contextWindow: 128000, maxTokens: 8192,
+          }]
+        }
+      };
     }));
   }
 
@@ -656,14 +722,22 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
   const tabHasRequired: Record<string, boolean> = { basic: true, model: true, agent: false, session: false, logging: false };
   const isConfigComplete = basicTabComplete && modelTabComplete;
 
-  // Control UI 动态 IP（用于非 HTTPS 场景的 URL 展示）
-  const controlUiHost = (() => {
-    if (resource?.type === "remote" && resource.host) return resource.host;
-    if (gwBind !== "loopback" && lanIp) return lanIp;
-    return "127.0.0.1";
-  })();
+  // ── Deploy log auto-scroll ─────────────────────
+  useEffect(() => {
+    deployLogEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [deployLogs]);
 
   // ── Loading ────────────────────────────────────
+
+  const containerVariants: import("framer-motion").Variants = {
+    hidden: { opacity: 0 },
+    show: { opacity: 1, transition: { staggerChildren: 0.05 } }
+  };
+
+  const itemVariants: import("framer-motion").Variants = {
+    hidden: { opacity: 0, y: 15 },
+    show: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 350, damping: 25 } }
+  };
 
   if (loading) {
     return (
@@ -676,70 +750,172 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
   // ── Render ─────────────────────────────────────
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden">
-      {/* Required warning */}
-      {!isConfigComplete && (
-        <div className="mb-3 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 flex items-center gap-2 shrink-0">
-          <AlertCircle className="w-4 h-4 text-amber-500 shrink-0" />
-          <span className="text-[12px] text-amber-700">
-            请完成必填项（标有 <span className="text-red-500 font-bold">*</span> 的字段）后才能保存配置并使用其他功能
-          </span>
-        </div>
-      )}
-
-      {/* Tab bar */}
-      <div className="flex gap-1 mb-4 shrink-0 border-b border-border/40 pb-px">
-        {configTabs.map((tab) => {
-          const complete = tabCompleteMap[tab.id] ?? true;
-          const hasReq = tabHasRequired[tab.id] ?? false;
-          return (
-            <button
-              key={tab.id}
-              onClick={() => { setActiveTab(tab.id); setSaveMsg(null); }}
-              className={cn(
-                "px-3 py-1.5 text-[13px] font-medium rounded-t-lg transition-colors -mb-px flex items-center gap-1.5",
-                activeTab === tab.id
-                  ? "text-primary border-b-2 border-primary"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
+    <>
+      <div className="flex-1 flex flex-col overflow-hidden relative">
+        {/* Required warning */}
+        <AnimatePresence>
+          {!isConfigComplete && (
+            <motion.div
+              initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+              animate={{ opacity: 1, height: "auto", marginBottom: 12 }}
+              exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+              className="overflow-hidden shrink-0"
             >
-              {tab.label}
-              {hasReq && !complete && (
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
-              )}
-              {hasReq && complete && (
-                <CheckCircle2 className="w-3.5 h-3.5 text-green-500 shrink-0" strokeWidth={2} />
-              )}
-            </button>
-          );
-        })}
+              <div className="px-3 py-2.5 rounded-xl bg-amber-50/80 border border-amber-200/60 shadow-sm flex items-center gap-2 backdrop-blur-sm">
+                <AlertCircle className="w-4 h-4 text-amber-500 shrink-0" />
+                <span className="text-[12px] text-amber-700 font-medium">
+                  请完成必填项（标有 <span className="text-red-500 font-bold">*</span> 的字段）后才能保存配置并使用其他功能
+                </span>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Tab bar */}
+        <div className="flex gap-1 mb-5 shrink-0 p-1 bg-secondary/50 rounded-xl max-w-fit shadow-inner border border-border/40">
+          {configTabs.map((tab) => {
+            const complete = tabCompleteMap[tab.id] ?? true;
+            const hasReq = tabHasRequired[tab.id] ?? false;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => { setActiveTab(tab.id); setSaveMsg(null); }}
+                className={cn(
+                  "relative px-4 py-1.5 text-[13px] font-medium rounded-lg transition-colors flex items-center gap-1.5 z-10",
+                  isActive
+                    ? "text-foreground"
+                    : "text-muted-foreground hover:text-foreground hover:bg-black/5"
+                )}
+              >
+                {isActive && (
+                  <motion.div
+                    layoutId="activeTabBadge"
+                    className="absolute inset-0 bg-white rounded-lg shadow-sm border border-black/5 z-[-1]"
+                    transition={{ type: "spring", bounce: 0.2, duration: 0.6 }}
+                  />
+                )}
+                {tab.label}
+                {hasReq && !complete && (
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
+                )}
+                {hasReq && complete && (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-green-500 shrink-0" strokeWidth={2} />
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Tab content */}
+        <div className="flex-1 overflow-auto pr-2 scroll-smooth">
+          <AnimatePresence mode="popLayout">
+            <motion.div
+              key={activeTab}
+              initial={{ opacity: 0, x: -10 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 10 }}
+              transition={{ duration: 0.2 }}
+              className="pb-6"
+            >
+              <motion.div
+                variants={containerVariants}
+                initial="hidden"
+                animate="show"
+                className="flex flex-col gap-5"
+              >
+                {activeTab === "basic" && renderBasicTab()}
+                {activeTab === "model" && renderModelTab()}
+                {activeTab === "agent" && renderAgentTab()}
+                {activeTab === "session" && renderSessionTab()}
+                {activeTab === "logging" && renderLoggingTab()}
+              </motion.div>
+            </motion.div>
+          </AnimatePresence>
+        </div>
+
+        {/* Footer */}
+        <div className="shrink-0 pt-3 mt-1 border-t border-border/60 flex items-center gap-3">
+          <Button onClick={handleSave} disabled={saving || !isConfigComplete} className="shadow-sm">
+            {saving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
+            保存配置
+          </Button>
+          {!isConfigComplete && !saving && (
+            <span className="text-[11px] text-amber-600 font-medium bg-amber-50 px-2 py-1 rounded-md border border-amber-200/50">请先完成必填项</span>
+          )}
+          {saveMsg && (
+            <motion.span
+              initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }}
+              className={cn("text-[12px] font-medium px-2 py-1 rounded-md", saveMsg.type === "ok" ? "text-green-600 bg-green-50 border border-green-200/50" : "text-red-500 bg-red-50 border border-red-200/50")}
+            >
+              {saveMsg.text}
+            </motion.span>
+          )}
+        </div>
       </div>
 
-      {/* Tab content */}
-      <div className="flex-1 overflow-auto space-y-5 pr-1">
-        {activeTab === "basic" && renderBasicTab()}
-        {activeTab === "model" && renderModelTab()}
-        {activeTab === "agent" && renderAgentTab()}
-        {activeTab === "session" && renderSessionTab()}
-        {activeTab === "logging" && renderLoggingTab()}
-      </div>
-
-      {/* Footer */}
-      <div className="shrink-0 pt-3 mt-3 border-t border-border/60 flex items-center gap-3">
-        <Button onClick={handleSave} disabled={saving || !isConfigComplete}>
-          {saving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
-          保存配置
-        </Button>
-        {!isConfigComplete && !saving && (
-          <span className="text-[11px] text-amber-600">请先完成必填项</span>
+      {/* Deploy log modal */}
+      <AnimatePresence>
+        {deployOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.95, y: 10, opacity: 0 }}
+              transition={{ type: "spring", stiffness: 350, damping: 25 }}
+              className="w-[560px] max-h-[70vh] bg-white rounded-2xl shadow-2xl border border-border/60 flex flex-col overflow-hidden"
+            >
+              <div className="flex items-center justify-between px-5 py-3.5 border-b border-border/40 bg-muted/40 backdrop-blur-md">
+                <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">
+                  {deployStatus === "running" && <Loader2 className="w-4 h-4 text-primary animate-spin" />}
+                  {deployStatus === "running" ? "正在部署..." : deployStatus === "success" ? "部署完成" : "部署失败"}
+                </h3>
+                {deployStatus !== "running" && (
+                  <button
+                    onClick={() => setDeployOpen(false)}
+                    className="p-1 rounded-md text-muted-foreground hover:bg-black/5 hover:text-foreground transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+              <div className="flex-1 overflow-y-auto p-5 font-mono text-[13px] leading-relaxed text-[#5a5a5a] scroll-mask-y bg-[linear-gradient(to_right,#8080800a_1px,transparent_1px),linear-gradient(to_bottom,#8080800a_1px,transparent_1px)] bg-[size:14px_24px]">
+                {deployLogs.map((line, i) => (
+                  <motion.div
+                    initial={{ opacity: 0, x: -5 }} animate={{ opacity: 1, x: 0 }} transition={{ duration: 0.2 }}
+                    key={i} className="whitespace-pre-wrap break-all mb-1"
+                  >
+                    {line}
+                  </motion.div>
+                ))}
+                <div ref={deployLogEndRef} className="h-4" />
+              </div>
+              {deployStatus !== "running" && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                  className={cn(
+                    "px-5 py-3.5 border-t border-border/40 flex items-center justify-between",
+                    deployStatus === "success" ? "bg-green-50/50" : "bg-red-50/50"
+                  )}>
+                  <span className={cn("text-[13px] font-medium flex items-center gap-1.5", deployStatus === "success" ? "text-green-600" : "text-red-600")}>
+                    {deployStatus === "success" ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+                    {deployStatus === "success" ? "全部完成，配置已生效" : "部署过程中出现错误"}
+                  </span>
+                  <Button size="sm" variant={deployStatus === "success" ? "default" : "outline"} onClick={() => setDeployOpen(false)} className="shadow-sm">
+                    关闭
+                  </Button>
+                </motion.div>
+              )}
+            </motion.div>
+          </motion.div>
         )}
-        {saveMsg && (
-          <span className={cn("text-[12px]", saveMsg.type === "ok" ? "text-green-500" : "text-red-400")}>
-            {saveMsg.text}
-          </span>
-        )}
-      </div>
-    </div>
+      </AnimatePresence>
+    </>
   );
 
   // ── Tab: 基本配置 ──────────────────────────────
@@ -747,200 +923,245 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
   function renderBasicTab() {
     return (
       <>
-        <section>
-          <Label required>运行模式</Label>
-          <Select value={gwMode} onChange={(e) => setGwMode(e.target.value)}>
-            <option value="local">local（本地运行）</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 local</p>
-        </section>
-
-        <section>
-          <Label required>网关端口</Label>
-          <Input value={gatewayPort} onChange={(e) => setGatewayPort(e.target.value)} placeholder="18789" type="number" className="text-[13px] h-9 w-32" />
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 18789</p>
-        </section>
-
-        <section>
-          <Label>网关绑定地址</Label>
-          <Select value={gwBind} onChange={(e) => setGwBind(e.target.value)} disabled={httpsProxyEnabled}>
-            {!isRemote && <option value="loopback">loopback（仅本机 127.0.0.1）</option>}
-            <option value="lan">lan（局域网 0.0.0.0）</option>
-            <option value="auto">auto（自动）</option>
-            <option value="tailnet">tailnet（仅 Tailscale IP）</option>
-          </Select>
-          {isRemote && (
-            <p className="text-[11px] text-muted-foreground mt-1.5">远程 Linux 需要绑定局域网地址才能通过 IP 访问</p>
-          )}
-          {!isRemote && (
-            <p className="text-[11px] text-muted-foreground mt-1.5">默认 loopback</p>
-          )}
-          {httpsProxyEnabled && (
-            <p className="text-[11px] text-yellow-600 mt-1">HTTPS 代理已开启，绑定地址自动设为 lan</p>
-          )}
-        </section>
-
-        <section>
-          <Label>认证模式</Label>
-          <Select value={gwAuthMode} onChange={(e) => setGwAuthMode(e.target.value)} disabled={httpsProxyEnabled}>
-            <option value="token">token（Token 认证）</option>
-            <option value="password">password（密码认证）</option>
-            {gwBind === "loopback" && <option value="none">none（无认证，仅限本机）</option>}
-            {gwBind !== "loopback" && <option value="trusted-proxy">trusted-proxy（反向代理认证）</option>}
-          </Select>
-          {gwAuthMode === "token" && (
-            <div className="mt-3">
-              <Label>认证 Token</Label>
-              <Input value={gwAuthToken} onChange={(e) => setGwAuthToken(e.target.value)} placeholder="留空使用自动生成的 token" type="password" className="text-[13px] h-9" />
-            </div>
-          )}
-          {gwAuthMode === "trusted-proxy" && (
-            <p className="text-[11px] text-muted-foreground mt-1.5">由 HTTPS 反向代理（Caddy）处理认证，无需 Token 或密码</p>
-          )}
-          {gwAuthMode !== "trusted-proxy" && (
-            <p className="text-[11px] text-muted-foreground mt-1.5">默认 token，安装向导自动生成</p>
-          )}
-          {httpsProxyEnabled && (
-            <p className="text-[11px] text-yellow-600 mt-1">HTTPS 代理已开启，认证模式自动设为 trusted-proxy</p>
-          )}
-        </section>
-
-        <section>
-          <Label required>工作目录</Label>
-          <Input value={workspace} onChange={(e) => setWorkspace(e.target.value)} placeholder="~/.openclaw/workspace" className="text-[13px] h-9" />
-          <p className="text-[11px] text-muted-foreground mt-1.5">Agent 文件存储目录，默认 ~/.openclaw/workspace</p>
-        </section>
-
-        <section>
-          <Label>用户时区</Label>
-          <Input value={userTimezone} onChange={(e) => setUserTimezone(e.target.value)} placeholder="跟随系统（如 Asia/Shanghai）" className="text-[13px] h-9" />
-          <p className="text-[11px] text-muted-foreground mt-1.5">留空则跟随系统时区</p>
-        </section>
-
-        <section>
-          <Label>时间格式</Label>
-          <Select value={timeFormat} onChange={(e) => setTimeFormat(e.target.value)}>
-            <option value="auto">auto（自动）</option>
-            <option value="12">12（12 小时制）</option>
-            <option value="24">24（24 小时制）</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 auto</p>
-        </section>
-
-        {/* HTTPS 代理：bind 非 loopback 时显示（局域网访问需要 HTTPS 安全上下文） */}
-        {gwBind !== "loopback" && (
-          <section className="rounded-lg border border-blue-200 bg-blue-50/50 p-4">
-            <h3 className="text-[13px] font-semibold text-foreground mb-2">HTTPS 代理（Caddy）</h3>
-            <p className="text-[11px] text-muted-foreground mb-3">
-              {isRemote
-                ? "远程 Linux 服务器需要 HTTPS 代理才能从浏览器访问 Control UI"
-                : "绑定局域网后，从其他设备通过 IP 访问需要 HTTPS（浏览器安全上下文要求）"}
-            </p>
-            <Checkbox
-              checked={httpsProxyEnabled}
-              onChange={(e) => {
-                const enabled = e.target.checked;
-                setHttpsProxyEnabled(enabled);
-                if (enabled) {
-                  setGwBind("lan");
-                  setGwAuthMode("trusted-proxy");
-                  setGwControlUi(true);
-                }
-              }}
-              label="启用 HTTPS 代理"
-            />
-            {httpsProxyEnabled && (
-              <div className="mt-3 space-y-3">
-                {!isRemote && (
-                  <div>
-                    <Label>本机局域网 IP</Label>
-                    <Input value={lanIp} onChange={(e) => setLanIp(e.target.value)} placeholder="如 192.168.1.100" className="text-[13px] h-9 w-48" />
-                    <p className="text-[11px] text-muted-foreground mt-1">自动检测，也可手动修改</p>
-                  </div>
-                )}
-                <div>
-                  <Label>HTTPS 对外端口</Label>
-                  <Input value={httpsProxyPort} onChange={(e) => setHttpsProxyPort(e.target.value)} placeholder="18790" type="number" className="text-[13px] h-9 w-32" />
-                  <p className="text-[11px] text-muted-foreground mt-1">浏览器访问端口，需与 OpenClaw 网关端口不同</p>
-                </div>
-                {effectiveHost && (
-                  <p className="text-[11px] text-blue-600">
-                    访问地址：<span className="font-mono">https://{effectiveHost}:{httpsProxyPort}{gwControlUiBasePath}</span>
-                  </p>
-                )}
-                {!isRemote && (
-                  <p className="text-[11px] text-yellow-600">
-                    本机需手动安装 Caddy 并配置反向代理，远程 Linux 可自动配置
-                  </p>
-                )}
+        {/* Card 1: 核心网络与访问 (Network & Access) */}
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🌐 网络与访问</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">配置 Gateway 的监听端口和绑定地址，控制哪些设备可以连接到你的 OpenClaw 服务。</p>
+          </div>
+          <div className="space-y-5">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label required>运行模式</Label>
+                <Select value={gwMode} onChange={(e) => setGwMode(e.target.value)}>
+                  <option value="local">local（本地运行模式）</option>
+                </Select>
+                <p className="text-[11px] text-muted-foreground mt-1.5">local 表示在本机运行 Gateway</p>
               </div>
-            )}
-          </section>
-        )}
+              <div>
+                <Label required>网关监听端口</Label>
+                <Input value={gatewayPort} onChange={(e) => setGatewayPort(e.target.value)} placeholder="18789" type="number" className="text-[13px] h-9" />
+                <p className="text-[11px] text-muted-foreground mt-1.5">Gateway 的 WS + HTTP 复用端口（默认 18789）</p>
+              </div>
+            </div>
 
-        <section>
-          <Label className="mb-2">控制面板</Label>
-          <Checkbox
-            checked={gwControlUi}
-            onChange={(e) => setGwControlUi(e.target.checked)}
-            label="启用 Control UI 控制面板"
-          />
-          {gwControlUi && (
-            <div className="mt-3">
-              <Label>Control UI 路径</Label>
-              <Input value={gwControlUiBasePath} onChange={(e) => setGwControlUiBasePath(e.target.value)} placeholder="/openclaw" className="text-[13px] h-9 w-48" />
+            <div>
+              <Label>绑定地址 (Bind)</Label>
+              {isRemote ? (
+                <>
+                  <Select value="lan" disabled>
+                    <option value="lan">lan（局域网公开 0.0.0.0）</option>
+                  </Select>
+                   <p className="text-[11px] text-muted-foreground mt-1.5">远程服务器已自动设为 lan (0.0.0.0)，允许外部设备连接</p>
+                </>
+              ) : (
+                <>
+                  <Select value={gwBind} onChange={(e) => setGwBind(e.target.value)} disabled={httpsProxyEnabled}>
+                    <option value="loopback">loopback（仅本机 127.0.0.1）</option>
+                    <option value="lan">lan（局域网 0.0.0.0，允许其他设备访问）</option>
+                    <option value="auto">auto（自动选择）</option>
+                    <option value="tailnet">tailnet（仅 Tailscale 虚拟 IP）</option>
+                  </Select>
+                   <p className="text-[11px] text-muted-foreground mt-1.5">仅自己使用建议选 loopback；需要手机或其他电脑访问选 lan</p>
+                  {httpsProxyEnabled && (
+                    <p className="text-[11px] text-yellow-600 mt-1">💡 HTTPS 代理已开启，绑定地址已被强制设为 lan</p>
+                  )}
+                </>
+              )}
             </div>
-          )}
-          <p className="text-[11px] text-muted-foreground mt-1.5">
-            启用后可通过{" "}
-            <span className="font-mono text-foreground">
-              {httpsProxyEnabled && effectiveHost
-                ? `https://${effectiveHost}:${httpsProxyPort}${gwControlUiBasePath}`
-                : `http://${controlUiHost}:${gatewayPort}${gwControlUiBasePath}`}
-            </span>
-            {" "}访问
-          </p>
-        </section>
 
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-3">命令配置</h3>
-          <div className="space-y-3">
-            <div>
-              <Label>原生命令</Label>
-              <Select value={cmdNative} onChange={(e) => setCmdNative(e.target.value)}>
-                <option value="auto">auto（自动检测）</option>
-                <option value="true">true（启用）</option>
-                <option value="false">false（禁用）</option>
-              </Select>
-              <p className="text-[11px] text-muted-foreground mt-1">默认 auto，控制是否注册原生平台命令</p>
+            {/* HTTPS Proxy Configuration grouped inside network settings */}
+            <div className="bg-blue-50/50 rounded-xl border border-blue-100/60 p-4 relative">
+              <div className="absolute top-0 right-0 w-32 h-32 bg-blue-400/5 blur-3xl rounded-full translate-x-1/2 -translate-y-1/2 pointer-events-none" />
+              {isRemote ? (
+                <>
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-[13px] font-semibold text-blue-900">HTTPS 代理</span>
+                    <CheckCircle2 className="w-4 h-4 text-green-500" strokeWidth={2} />
+                  </div>
+                  <div>
+                    <Label className="text-blue-900">外部访问 HTTPS 端口</Label>
+                    <Input value={httpsProxyPort} onChange={(e) => setHttpsProxyPort(e.target.value)} placeholder="18790" type="number" className="text-[13px] h-9 w-32 border-blue-200/60 bg-white/60 focus-visible:ring-blue-500/30 focus-visible:border-blue-500 mt-1" />
+                  </div>
+                </>
+              ) : gwBind !== "loopback" ? (
+                <>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[13px] font-semibold text-blue-900">HTTPS 代理 (Caddy)</span>
+                    <Checkbox
+                      checked={httpsProxyEnabled}
+                      onChange={(e) => {
+                        const enabled = e.target.checked;
+                        setHttpsProxyEnabled(enabled);
+                        if (enabled) {
+                          setGwBind("lan");
+                          setGwControlUi(true);
+                        }
+                      }}
+                      label="启用 HTTPS 加密"
+                    />
+                  </div>
+                  <p className="text-[11px] text-blue-700/80 mb-4 leading-relaxed">
+                    绑定地址设为 lan 后，建议开启 HTTPS 代理。部分浏览器在非 HTTPS 环境下会禁用麦克风和剪贴板等功能。
+                  </p>
+                  {httpsProxyEnabled && (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <Label className="text-blue-900">本机局域网 IP</Label>
+                        <Input value={lanIp} onChange={(e) => setLanIp(e.target.value)} placeholder="如 192.168.1.100" className="text-[13px] h-9 border-blue-200/60 bg-white/60 focus-visible:ring-blue-500/30 focus-visible:border-blue-500 mt-1" />
+                      </div>
+                      <div>
+                        <Label className="text-blue-900">HTTPS 对外代理端口</Label>
+                        <Input value={httpsProxyPort} onChange={(e) => setHttpsProxyPort(e.target.value)} placeholder="18790" type="number" className="text-[13px] h-9 border-blue-200/60 bg-white/60 focus-visible:ring-blue-500/30 focus-visible:border-blue-500 mt-1" />
+                        <p className="text-[11px] text-blue-700/70 mt-1.5">不能与 Gateway 端口相同</p>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="text-[13px] font-semibold text-blue-900/60">HTTPS 代理</span>
+                    <span className="px-1.5 py-0.5 rounded-[4px] bg-blue-100 text-blue-600 text-[10px] font-bold">暂不可用</span>
+                  </div>
+                  <p className="text-[11px] text-blue-700/60 leading-relaxed">
+                    当前绑定地址为 loopback，仅本机访问无需 HTTPS。切换为 lan 后可启用。
+                  </p>
+                </div>
+              )}
             </div>
-            <div>
-              <Label>原生技能命令</Label>
-              <Select value={cmdNativeSkills} onChange={(e) => setCmdNativeSkills(e.target.value)}>
-                <option value="auto">auto（自动检测）</option>
-                <option value="true">true（启用）</option>
-                <option value="false">false（禁用）</option>
-              </Select>
-              <p className="text-[11px] text-muted-foreground mt-1">默认 auto，控制是否注册原生技能命令</p>
-            </div>
-            <div>
-              <Label>所有者显示格式</Label>
-              <Select value={cmdOwnerDisplay} onChange={(e) => setCmdOwnerDisplay(e.target.value)}>
-                <option value="raw">raw（原始格式）</option>
-                <option value="name">name（显示名称）</option>
-              </Select>
-              <p className="text-[11px] text-muted-foreground mt-1">默认 raw</p>
-            </div>
-            <div>
-              <Checkbox
-                checked={cmdRestart}
-                onChange={(e) => setCmdRestart(e.target.checked)}
-                label="允许重启命令"
-              />
-              <p className="text-[11px] text-muted-foreground mt-1">默认关闭，启用后允许 /restart 命令和网关重启工具</p>
+
+            <div className="pt-2 border-t border-border/40">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <span className="text-[13px] font-medium text-foreground block">🎨 启用 Control UI（网页控制面板）</span>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">提供一个可视化的网页界面，可以在浏览器中聊天、管理配置和查看会话</p>
+                </div>
+                <Checkbox checked={gwControlUi} onChange={(e) => setGwControlUi(e.target.checked)} />
+              </div>
+              {gwControlUi && (
+                <div className="mt-3 pl-3 border-l-2 border-primary/20">
+                  <Label>访问路径 (Base Path)</Label>
+                  <Input value={gwControlUiBasePath} onChange={(e) => setGwControlUiBasePath(e.target.value)} placeholder="/openclaw" className="text-[13px] h-9 max-w-[240px] mt-1" />
+                </div>
+              )}
             </div>
           </div>
-        </section>
+        </motion.section>
+
+        {/* Card 2: 安全与认证 (Security & Authentication) */}
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🛡️ 接口认证 (Auth)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">设置 Gateway 的访问认证方式，防止未授权的请求访问你的服务。</p>
+          </div>
+          <div className="space-y-4">
+            <div>
+              <Label>认证方式 (Auth Mode)</Label>
+              {isRemote ? (
+                <>
+                  <Select value={gwAuthMode} onChange={(e) => setGwAuthMode(e.target.value)} className="mt-1 max-w-[280px]">
+                    <option value="token">API Token (高安全加密令牌 - 推荐)</option>
+                    <option value="password">Password (传统密码校验)</option>
+                  </Select>
+                   <p className="text-[11px] text-muted-foreground mt-1.5">远程部署需要认证保护。推荐使用 Token 方式。</p>
+                </>
+              ) : (
+                <>
+                  <Select value={gwAuthMode} onChange={(e) => setGwAuthMode(e.target.value)} className="mt-1 max-w-[320px]">
+                    <option value="token">Token（API 令牌认证，推荐）</option>
+                    <option value="password">Password（密码认证）</option>
+                    {gwBind === "loopback" && <option value="none">None（关闭认证，仅限 loopback）</option>}
+                    {gwBind !== "loopback" && <option value="trusted-proxy">Trusted Proxy（信任前置反向代理）</option>}
+                  </Select>
+                  {gwAuthMode === "trusted-proxy" && (
+                     <p className="text-[11px] text-amber-600 mt-1.5">⚠️ 使用 Trusted Proxy 模式时，请确保你的反向代理（如 Nginx）已正确配置身份认证</p>
+                  )}
+                </>
+              )}
+            </div>
+
+            {gwAuthMode === "token" && (
+              <div className="p-3 bg-muted/30 rounded-lg border border-border/40">
+                <Label>Token 密钥</Label>
+                <Input value={gwAuthToken} onChange={(e) => setGwAuthToken(e.target.value)} placeholder="留空则自动生成" type="password" className="text-[13px] h-9 mt-1.5 max-w-[320px]" />
+                <p className="text-[11px] text-muted-foreground mt-1.5">留空时安装向导会自动生成一个高强度 Token</p>
+              </div>
+            )}
+          </div>
+        </motion.section>
+
+        {/* Card 3: 运行环境参数 */}
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">⚙️ 存储与时区</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">设置 Agent 的工作目录和时区偏好。</p>
+          </div>
+          <div className="space-y-4">
+            <div>
+              <Label required>工作目录 (Workspace)</Label>
+              <Input value={workspace} onChange={(e) => setWorkspace(e.target.value)} placeholder="~/.openclaw/workspace" className="text-[13px] h-9 mt-1" />
+              <p className="text-[11px] text-muted-foreground mt-1.5">Agent 的记忆、日志、上传文件等都存放在这里</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label>时区 (userTimezone)</Label>
+                <Input value={userTimezone} onChange={(e) => setUserTimezone(e.target.value)} placeholder="留空将自适应系统 (如 Asia/Shanghai)" className="text-[13px] h-9 mt-1" />
+                <p className="text-[11px] text-muted-foreground mt-1.5">留空则使用系统时区，也可手动指定如 Asia/Shanghai</p>
+              </div>
+              <div>
+                <Label>时间格式 (timeFormat)</Label>
+                <Select value={timeFormat} onChange={(e) => setTimeFormat(e.target.value)} className="mt-1">
+                  <option value="auto">auto（跟随系统地区）</option>
+                  <option value="12">12（AM/PM 格式）</option>
+                  <option value="24">24（24 小时制）</option>
+                </Select>
+              </div>
+            </div>
+          </div>
+        </motion.section>
+
+        {/* Card 4: 开发者与高级命令 */}
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🛠️ 聊天命令 (Commands)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">控制在 Telegram、Discord 等聊天平台中的命令菜单注册行为。</p>
+          </div>
+          <div className="grid grid-cols-2 gap-x-6 gap-y-5">
+            <div>
+              <Label>原生命令注册 (native)</Label>
+              <Select value={cmdNative} onChange={(e) => setCmdNative(e.target.value)} className="mt-1">
+                <option value="auto">auto（自动判断是否注册）</option>
+                <option value="true">true（强制注册）</option>
+                <option value="false">false（关闭注册）</option>
+              </Select>
+            </div>
+            <div>
+              <Label>技能命令 (nativeSkills)</Label>
+              <Select value={cmdNativeSkills} onChange={(e) => setCmdNativeSkills(e.target.value)} className="mt-1">
+                <option value="auto">auto（自动判断）</option>
+                <option value="true">true（注册技能命令）</option>
+                <option value="false">false（不注册）</option>
+              </Select>
+            </div>
+            <div>
+              <Label>发送者 ID 显示格式</Label>
+              <Select value={cmdOwnerDisplay} onChange={(e) => setCmdOwnerDisplay(e.target.value)} className="mt-1">
+                <option value="raw">原始数字与标头表示</option>
+                <option value="name">自动匹配名字与美化</option>
+              </Select>
+              <p className="text-[11px] text-muted-foreground mt-1.5">日志中发送者显示为原始 ID 还是可读名称</p>
+            </div>
+            <div className="flex flex-col justify-center">
+              <div className="flex items-center gap-2 mt-1">
+                <Checkbox checked={cmdRestart} onChange={(e) => setCmdRestart(e.target.checked)} id="chk-restart" />
+                <label className="text-[13px] font-semibold text-foreground cursor-pointer select-none" htmlFor="chk-restart">允许 /restart 命令</label>
+              </div>
+              <p className="text-[11px] text-muted-foreground mt-1 pl-6">允许通过聊天命令重启 Gateway</p>
+            </div>
+          </div>
+        </motion.section>
       </>
     );
   }
@@ -949,252 +1170,258 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
 
   function renderModelTab() {
     return (
-      <>
-        {/* 模型合并模式 */}
-        <section>
-          <Label>模型目录模式</Label>
-          <Select value={modelsMode} onChange={(e) => setModelsMode(e.target.value)}>
-            <option value="merge">merge（合并，默认）</option>
-            <option value="replace">replace（完全替换）</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">merge 将自定义提供商与内置目录合并；replace 完全使用自定义配置</p>
-        </section>
+            <div className="flex flex-col gap-5">
+              {/* Card 1: 内置模型 API 密钥 (Official Keys) */}
+              <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+                <div className="mb-4">
+                  <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">
+                    ☁️ 官方 API 密钥 (Official API Keys)
+                    {!hasApiKeyOrProvider && <span className="text-red-500">*</span>}
+                    {hasAnyEnvKey && <CheckCircle2 className="w-4 h-4 text-green-500" strokeWidth={2} />}
+                  </h3>
+                  <p className="text-[12px] text-muted-foreground mt-1 leading-relaxed">
+                    在这里填写主流 AI 厂商的 API 密钥。这些密钥会通过 env 配置传递给 OpenClaw。
+                    {!hasApiKeyOrProvider && (
+                      <span className="font-medium text-red-500 block mt-1.5">
+                        你至少需要填写一个 API 密钥，或在下方添加自定义提供商。
+                      </span>
+                    )}
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  {BUILTIN_ENV_KEYS.map((def) => (
+                    <div key={def.key} className="flex items-center gap-3 p-1.5 hover:bg-muted/40 rounded-xl transition-colors">
+                      <span className="text-[13px] font-semibold text-foreground/80 w-28 shrink-0">{def.label}</span>
+                      <Input
+                        value={envKeys[def.key] || ""}
+                        onChange={(e) => setEnvKeys((prev) => {
+                          const next = { ...prev };
+                          if (e.target.value) next[def.key] = e.target.value;
+                          else delete next[def.key];
+                          return next;
+                        })}
+                        placeholder={def.placeholder}
+                        type="password"
+                        className="text-[13px] h-9 flex-1 shadow-sm font-mono tracking-widest text-primary/80"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </motion.section>
 
-        {/* ── 内置模型 API 密钥 ── */}
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-1 flex items-center gap-1">
-            内置模型 API 密钥
-            {!hasApiKeyOrProvider && <span className="text-red-500">*</span>}
-            {hasAnyEnvKey && <CheckCircle2 className="w-3.5 h-3.5 text-green-500 ml-1" strokeWidth={2} />}
-          </h3>
-          <p className="text-[11px] text-muted-foreground mb-3">
-            使用 OpenClaw 内置模型供应商时，在此填写对应的 API Key。
-            {!hasApiKeyOrProvider && (
-              <span className="font-medium text-red-500">
-                至少填写一个 API Key 或在下方配置一个自定义提供商（二选一）。
-              </span>
-            )}
-          </p>
-          <div className="space-y-2.5">
-            {BUILTIN_ENV_KEYS.map((def) => (
-              <div key={def.key} className="flex items-center gap-2">
-                <span className="text-[13px] text-foreground w-28 shrink-0">{def.label}</span>
-                <Input
-                  value={envKeys[def.key] || ""}
-                  onChange={(e) => setEnvKeys((prev) => {
-                    const next = { ...prev };
-                    if (e.target.value) next[def.key] = e.target.value;
-                    else delete next[def.key];
-                    return next;
-                  })}
-                  placeholder={def.placeholder}
-                  type="password"
-                  className="text-[13px] h-8 flex-1"
-                />
-              </div>
-            ))}
-          </div>
-          <p className="text-[11px] text-muted-foreground mt-2">
-            密钥保存在配置文件的 <span className="font-mono">env</span> 字段中，如 <span className="font-mono">ANTHROPIC_API_KEY</span>、<span className="font-mono">OPENAI_API_KEY</span> 等。
-          </p>
-        </section>
+              {/* Card 2: 自定义模型提供商 (Custom providers) */}
+              <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+                <div className="mb-4 flex items-start justify-between">
+                  <div>
+                    <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">
+                      🔌 自定义模型提供商 (Custom Providers)
+                      {!hasApiKeyOrProvider && <span className="text-red-500">*</span>}
+                      {!hasAnyEnvKey && providers.length > 0 && customProvidersComplete && (
+                        <CheckCircle2 className="w-4 h-4 text-green-500" strokeWidth={2} />
+                      )}
+                    </h3>
+                    <p className="text-[12px] text-muted-foreground mt-1.5 max-w-lg leading-relaxed">
+                      如果你使用中转平台（如阿里百炼、OneAPI、LiteLLM）或本地模型（如 Ollama），在这里添加提供商配置。
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => openUrl("https://bailian.console.aliyun.com/cn-beijing/?tab=coding-plan#/efm/index")}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 border border-blue-100 text-blue-600 text-[12px] font-medium transition-all shadow-sm hover:shadow active:scale-95"
+                  >
+                  百炼<ExternalLink className="w-3.5 h-3.5" />
+                  </button>
+                </div>
 
-        {/* ── 模型选择 ── */}
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-3">模型选择</h3>
-          <div className="space-y-3">
-            <div>
-              <Label required>主模型</Label>
-              <div className="flex gap-2">
-                <Input
-                  value={primaryModel}
-                  onChange={(e) => setPrimaryModel(e.target.value)}
-                  placeholder="如 anthropic/claude-sonnet-4-5"
-                  className="text-[13px] h-9 flex-1"
-                />
-                <ModelPickerSelect
-                  options={allModelOptions}
-                  exclude={[]}
-                  onSelect={(id) => setPrimaryModel(id)}
-                />
-              </div>
-              <p className="text-[11px] text-muted-foreground mt-1">
-                格式：<span className="font-mono">provider/model-id</span>。
-                内置模型（anthropic、openai 等）可直接填写或从右侧选择，自定义提供商的模型需先在下方配置。
-              </p>
-            </div>
-            <div>
-              <Label>备用模型</Label>
-              <div className="flex flex-wrap gap-1.5 mb-2">
-                {fallbackModels.map((f) => (
-                  <TagChip key={f} label={f} onRemove={() => setFallbackModels((prev) => prev.filter((x) => x !== f))} />
-                ))}
-                {fallbackModels.length === 0 && <span className="text-[12px] text-muted-foreground">未配置</span>}
-              </div>
-              <div className="flex gap-2">
-                <Input
-                  placeholder="输入备用模型 ID 后回车添加"
-                  className="text-[13px] h-9 flex-1"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      const v = (e.target as HTMLInputElement).value.trim();
-                      if (v && !fallbackModels.includes(v)) {
-                        setFallbackModels((prev) => [...prev, v]);
-                        (e.target as HTMLInputElement).value = "";
-                      }
-                    }
-                  }}
-                />
-                <ModelPickerSelect
-                  options={allModelOptions}
-                  exclude={[primaryModel, ...fallbackModels]}
-                  onSelect={(id) => {
-                    if (!fallbackModels.includes(id)) setFallbackModels((prev) => [...prev, id]);
-                  }}
-                />
-              </div>
-              <p className="text-[11px] text-muted-foreground mt-1">主模型不可用时按顺序切换</p>
-            </div>
-            <div>
-              <Label>图片模型</Label>
-              <div className="flex gap-2">
-                <Input
-                  value={imageModel}
-                  onChange={(e) => setImageModel(e.target.value)}
-                  placeholder="如 openrouter/qwen/qwen-2.5-vl-72b-instruct:free"
-                  className="text-[13px] h-9 flex-1"
-                />
-                <ModelPickerSelect
-                  options={allModelOptions}
-                  exclude={[]}
-                  onSelect={(id) => setImageModel(id)}
-                />
-              </div>
-              <p className="text-[11px] text-muted-foreground mt-1">用于图片处理，留空使用默认</p>
-            </div>
-            <div>
-              <Label>PDF 模型</Label>
-              <div className="flex gap-2">
-                <Input
-                  value={pdfModel}
-                  onChange={(e) => setPdfModel(e.target.value)}
-                  placeholder="如 anthropic/claude-opus-4-6"
-                  className="text-[13px] h-9 flex-1"
-                />
-                <ModelPickerSelect
-                  options={allModelOptions}
-                  exclude={[]}
-                  onSelect={(id) => setPdfModel(id)}
-                />
-              </div>
-              <p className="text-[11px] text-muted-foreground mt-1">用于 PDF 文档处理，留空则依次回退到图片模型、供应商默认</p>
-            </div>
-          </div>
-        </section>
+                <div className="mb-5 p-3 bg-muted/30 rounded-lg border border-border/40 flex items-center justify-between">
+                  <div>
+                    <Label className="text-[13px]">模型合并模式 (models.mode)</Label>
+                    <p className="text-[11px] text-muted-foreground mt-0.5">当自定义提供商的模型与内置模型重名时，如何处理</p>
+                  </div>
+                  <Select value={modelsMode} onChange={(e) => setModelsMode(e.target.value)} className="w-48 shadow-sm">
+                    <option value="merge">merge（合并，推荐）</option>
+                    <option value="replace">replace（完全替换内置列表）</option>
+                  </Select>
+                </div>
 
-        {/* ── 自定义模型提供商（可选，支持多个）── */}
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-1 flex items-center gap-2">
-            自定义模型提供商
-            {!hasApiKeyOrProvider && <span className="text-red-500 text-[13px]">*</span>}
-            {!hasAnyEnvKey && providers.length > 0 && customProvidersComplete && (
-              <CheckCircle2 className="w-3.5 h-3.5 text-green-500" strokeWidth={2} />
-            )}
-            <span className="text-[11px] font-normal text-muted-foreground">
-              {hasAnyEnvKey ? "（可选，使用第三方 API 时填写）" : "（未填写内置 API 密钥时必须配置）"}
-            </span>
-            <button
-              onClick={() => openUrl("https://bailian.console.aliyun.com/cn-beijing/?tab=coding-plan#/efm/index")}
-              className="ml-auto flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 hover:bg-blue-100 text-blue-500 text-[11px] font-medium transition-colors"
-            >
-              百炼 <ExternalLink className="w-3 h-3" />
-            </button>
-          </h3>
-          <p className="text-[11px] text-muted-foreground mb-3">
-            使用 OpenClaw 内置模型（anthropic、openai、google、openrouter、groq、minimax、zai、moonshot、qwen 等）无需配置此项，直接在上方填写模型 ID 即可。
-            仅在使用第三方 API 或自建代理时添加自定义提供商。
-            {!hasApiKeyOrProvider && (
-              <span className="font-medium text-red-500">
-                与上方内置 API 密钥二选一，至少完成一项。
-              </span>
-            )}
-          </p>
+                <div className="space-y-4">
+                  {providers.map((entry, idx) => (
+                    <ProviderCard
+                      key={idx}
+                      entry={entry}
+                      idx={idx}
+                      onUpdate={updateProvider}
+                      onRemove={removeProvider}
+                      onAddModel={addModelToProvider}
+                      onRemoveModel={removeModelFromProvider}
+                      urlToProviderId={urlToProviderId}
+                    />
+                  ))}
 
-          {providers.map((entry, idx) => (
-            <ProviderCard
-              key={idx}
-              entry={entry}
-              idx={idx}
-              onUpdate={updateProvider}
-              onRemove={removeProvider}
-              onAddModel={addModelToProvider}
-              onRemoveModel={removeModelFromProvider}
-              urlToProviderId={urlToProviderId}
-            />
-          ))}
+                  <Button variant="outline" size="sm" onClick={addProvider} className="w-full border-dashed border-2 py-5 text-muted-foreground hover:text-foreground hover:border-primary/50 bg-transparent hover:bg-primary/5 shadow-none transition-colors duration-300">
+                    <Plus className="w-4 h-4 mr-2" /> 添加自定义提供商
+                  </Button>
+                </div>
+              </motion.section>
 
-          <Button variant="outline" size="sm" onClick={addProvider} className="mt-2">
-            <Plus className="w-3.5 h-3.5 mr-1" /> 添加自定义提供商
-          </Button>
-        </section>
+              {/* Card 3: 智脑驱动引擎 (Core AI Engine) */}
+              <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+                <div className="mb-4">
+                  <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🧠 模型选择</h3>
+                  <p className="text-[12px] text-muted-foreground mt-1">配置主模型、回退模型和专用模型。格式：provider/model-id。</p>
+                </div>
+                <div className="space-y-4">
+                  <div>
+                    <Label required>主模型 (model.primary)</Label>
+                    <div className="flex gap-2 mt-1">
+                      <Input
+                        value={primaryModel}
+                        onChange={(e) => setPrimaryModel(e.target.value)}
+                        placeholder="如 anthropic/claude-sonnet-4-5"
+                        className="text-[13px] h-9 flex-1 shadow-sm"
+                      />
+                      <ModelPickerSelect
+                        options={allModelOptions}
+                        exclude={[]}
+                        onSelect={(id) => setPrimaryModel(id)}
+                      />
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-1.5">日常调用的主模型。格式：<span className="font-mono bg-muted px-1.5 py-0.5 rounded border border-border/50 text-primary/90">provider/model-id</span></p>
+                  </div>
 
-        {/* 运行参数 */}
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-3">运行参数</h3>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <Label>最大并发数</Label>
-              <Input value={maxConcurrent} onChange={(e) => setMaxConcurrent(e.target.value)} type="number" placeholder="1" className="text-[13px] h-9" />
-            </div>
-            <div>
-              <Label>超时时间（秒）</Label>
-              <Input value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} type="number" placeholder="600" className="text-[13px] h-9" />
-            </div>
-            <div>
-              <Label>思考模式</Label>
-              <Select value={thinkingDefault} onChange={(e) => setThinkingDefault(e.target.value)}>
-                <option value="off">off（关闭）</option>
-                <option value="low">low（低）</option>
-                <option value="medium">medium（中）</option>
-                <option value="high">high（高）</option>
-              </Select>
-            </div>
-            <div>
-              <Label>上下文 Token 上限</Label>
-              <Input value={contextTokens} onChange={(e) => setContextTokens(e.target.value)} type="number" placeholder="200000" className="text-[13px] h-9" />
-            </div>
-            <div>
-              <Label>详细输出</Label>
-              <Select value={verboseDefault} onChange={(e) => setVerboseDefault(e.target.value)}>
-                <option value="off">off（关闭）</option>
-                <option value="on">on（开启）</option>
-              </Select>
-            </div>
-            <div>
-              <Label>提权工具</Label>
-              <Select value={elevatedDefault} onChange={(e) => setElevatedDefault(e.target.value)}>
-                <option value="on">on（允许）</option>
-                <option value="off">off（禁用）</option>
-              </Select>
-            </div>
-            <div>
-              <Label>媒体大小上限（MB）</Label>
-              <Input value={mediaMaxMb} onChange={(e) => setMediaMaxMb(e.target.value)} type="number" placeholder="5" className="text-[13px] h-9" />
-            </div>
-          </div>
-          <p className="text-[11px] text-muted-foreground mt-1.5">并发默认 1，超时默认 600s，思考默认 low，上下文默认 200000，媒体默认 5MB</p>
-        </section>
+                  <div className="p-3 bg-muted/40 rounded-xl border border-border/60">
+                    <Label>回退模型 (model.fallbacks)</Label>
+                    <div className="flex flex-wrap gap-1.5 mt-2 mb-2.5">
+                      {fallbackModels.map((f) => (
+                        <TagChip key={f} label={f} onRemove={() => setFallbackModels((prev) => prev.filter((x) => x !== f))} />
+                      ))}
+                      {fallbackModels.length === 0 && <span className="text-[12px] text-muted-foreground font-medium my-1">未配置回退模型</span>}
+                    </div>
+                    <div className="flex gap-2">
+                      <Input
+                        placeholder="输入模型 ID 并按回车添加"
+                        className="text-[13px] h-9 flex-1 bg-background shadow-sm"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            const v = (e.target as HTMLInputElement).value.trim();
+                            if (v && !fallbackModels.includes(v)) {
+                              setFallbackModels((prev) => [...prev, v]);
+                              (e.target as HTMLInputElement).value = "";
+                            }
+                          }
+                        }}
+                      />
+                      <ModelPickerSelect
+                        options={allModelOptions}
+                        exclude={[primaryModel, ...fallbackModels]}
+                        onSelect={(id) => {
+                          if (!fallbackModels.includes(id)) setFallbackModels((prev) => [...prev, id]);
+                        }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-1.5 leading-relaxed">当主模型不可用时，系统会按顺序自动切换到回退模型，确保对话不中断。</p>
+                  </div>
 
-        {/* 压缩策略 */}
-        <section>
-          <Label>会话压缩模式</Label>
-          <Select value={compactionMode} onChange={(e) => setCompactionMode(e.target.value)}>
-            <option value="default">default（默认压缩）</option>
-            <option value="safeguard">safeguard（分块摘要，防止信息丢失）</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 safeguard，对长对话进行分块摘要以保留关键信息</p>
-        </section>
-      </>
+                  <div className="grid grid-cols-2 gap-4 pt-3 mt-1 border-t border-border/40">
+                    <div>
+                      <Label>图片模型 (imageModel)</Label>
+                      <div className="flex gap-2 mt-1">
+                        <Input
+                          value={imageModel}
+                          onChange={(e) => setImageModel(e.target.value)}
+                          placeholder="留白则回推缺省配置"
+                          className="text-[13px] h-9 flex-1 shadow-sm"
+                        />
+                        <ModelPickerSelect
+                          options={allModelOptions}
+                          exclude={[]}
+                          onSelect={(id) => setImageModel(id)}
+                        />
+                      </div>
+                      <p className="text-[11px] text-muted-foreground mt-1.5">处理图片输入时使用的模型，留空则使用主模型</p>
+                    </div>
+                    <div>
+                      <Label>PDF 模型 (pdfModel)</Label>
+                      <div className="flex gap-2 mt-1">
+                        <Input
+                          value={pdfModel}
+                          onChange={(e) => setPdfModel(e.target.value)}
+                          placeholder="留白则向图模退避转移"
+                          className="text-[13px] h-9 flex-1 shadow-sm"
+                        />
+                        <ModelPickerSelect
+                          options={allModelOptions}
+                          exclude={[]}
+                          onSelect={(id) => setPdfModel(id)}
+                        />
+                      </div>
+                      <p className="text-[11px] text-muted-foreground mt-1.5">处理 PDF 文档时使用的模型，留空则回退到图片模型</p>
+                    </div>
+                  </div>
+                </div>
+              </motion.section>
+
+              {/* Card 4: 性能与运行参数 */}
+              <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+                <div className="mb-4">
+                  <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">⚡ 性能与运行参数</h3>
+                  <p className="text-[12px] text-muted-foreground mt-1.5">高级调校参数，通常保持默认即可。</p>
+                </div>
+                <div className="grid grid-cols-2 gap-x-6 gap-y-5">
+                  <div>
+                    <Label>会话压缩模式 (compaction)</Label>
+                    <Select value={compactionMode} onChange={(e) => setCompactionMode(e.target.value)} className="mt-1 shadow-sm">
+                      <option value="default">default（简单截断）</option>
+                      <option value="safeguard">safeguard（分块摘要，推荐）</option>
+                    </Select>
+                    <p className="text-[11px] text-muted-foreground mt-1.5">safeguard 会在 Token 超限时智能压缩历史记录，保留核心上下文</p>
+                  </div>
+                  <div>
+                    <Label>深度推理 (thinkingDefault)</Label>
+                    <Select value={thinkingDefault} onChange={(e) => setThinkingDefault(e.target.value)} className="mt-1 shadow-sm">
+                      <option value="off">off（关闭）</option>
+                      <option value="low">low（低）</option>
+                      <option value="medium">medium（中）</option>
+                      <option value="high">high（高）</option>
+                    </Select>
+                    <p className="text-[11px] text-muted-foreground mt-1.5">适用于支持推理的模型（如 Claude 3.7、o3-mini）</p>
+                  </div>
+                  <div>
+                    <Label>最大并发数 (maxConcurrent)</Label>
+                    <Input value={maxConcurrent} onChange={(e) => setMaxConcurrent(e.target.value)} type="number" placeholder="1" className="text-[13px] h-9 mt-1 shadow-sm" />
+                    <p className="text-[11px] text-muted-foreground mt-1.5">跨会话的最大并行 Agent 运行数（默认 1）</p>
+                  </div>
+                  <div>
+                    <Label>响应超时 (timeoutSeconds)</Label>
+                    <Input value={timeoutSeconds} onChange={(e) => setTimeoutSeconds(e.target.value)} type="number" placeholder="600" className="text-[13px] h-9 mt-1 shadow-sm" />
+                    <p className="text-[11px] text-muted-foreground mt-1.5">AI 响应的最大等待时间（秒，默认 600）</p>
+                  </div>
+                  <div>
+                    <Label>上下文 Token 上限 (contextTokens)</Label>
+                    <Input value={contextTokens} onChange={(e) => setContextTokens(e.target.value)} type="number" placeholder="200000" className="text-[13px] h-9 mt-1 shadow-sm" />
+                    <p className="text-[11px] text-muted-foreground mt-1.5">单次会话的最大 Token 数（默认 200,000）</p>
+                  </div>
+                  <div>
+                    <Label>媒体上传限制 (mediaMaxMb)</Label>
+                    <Input value={mediaMaxMb} onChange={(e) => setMediaMaxMb(e.target.value)} type="number" placeholder="5" className="text-[13px] h-9 mt-1 shadow-sm" />
+                    <p className="text-[11px] text-muted-foreground mt-1.5">单个媒体文件的最大大小（MB，默认 5）</p>
+                  </div>
+                  <div>
+                    <Label>详细日志 (verboseDefault)</Label>
+                    <Select value={verboseDefault} onChange={(e) => setVerboseDefault(e.target.value)} className="mt-1 shadow-sm">
+                      <option value="off">off（关闭）</option>
+                      <option value="on">on（开启详细输出）</option>
+                    </Select>
+                  </div>
+                  <div>
+                    <Label>工具提权 (elevatedDefault)</Label>
+                    <Select value={elevatedDefault} onChange={(e) => setElevatedDefault(e.target.value)} className="mt-1 shadow-sm">
+                      <option value="on">on（允许提权操作）</option>
+                      <option value="off">off（禁止）</option>
+                    </Select>
+                  </div>
+                </div>
+              </motion.section>
+      </div>
     );
   }
 
@@ -1202,40 +1429,47 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
 
   function renderAgentTab() {
     return (
-      <>
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-3">Agent 身份</h3>
-          <div className="space-y-3">
+      <div className="flex flex-col gap-5">
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🤖 Agent 身份 (Identity)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">设置 AI 助手的名称、风格和代表表情。</p>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
             <div>
-              <Label>名称</Label>
-              <Input value={identityName} onChange={(e) => setIdentityName(e.target.value)} placeholder="如 Samantha" className="text-[13px] h-9" />
+              <Label>名称 (identity.name)</Label>
+              <Input value={identityName} onChange={(e) => setIdentityName(e.target.value)} placeholder="如 Samantha" className="text-[13px] h-9 mt-1 shadow-sm" />
             </div>
             <div>
-              <Label>主题 / 风格</Label>
-              <Input value={identityTheme} onChange={(e) => setIdentityTheme(e.target.value)} placeholder="如 helpful sloth" className="text-[13px] h-9" />
+              <Label>风格主题 (identity.theme)</Label>
+              <Input value={identityTheme} onChange={(e) => setIdentityTheme(e.target.value)} placeholder="如 helpful sloth" className="text-[13px] h-9 mt-1 shadow-sm" />
             </div>
-            <div>
-              <Label>Emoji 标识</Label>
-              <Input value={identityEmoji} onChange={(e) => setIdentityEmoji(e.target.value)} placeholder="如 🦥" className="text-[13px] h-9 w-24" />
+            <div className="col-span-2">
+              <Label>表情 (identity.emoji)</Label>
+              <Input value={identityEmoji} onChange={(e) => setIdentityEmoji(e.target.value)} placeholder="如 🦥" className="text-[13px] h-9 w-24 mt-1 shadow-sm text-center" />
             </div>
           </div>
-        </section>
+        </motion.section>
 
-        <section>
-          <h3 className="text-[13px] font-semibold text-foreground mb-3">消息设置</h3>
-          <div className="space-y-3">
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">💬 消息显示 (Messages)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">设置 AI 回复时的前缀和确认反应。</p>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
             <div>
-              <Label>回复前缀</Label>
-              <Input value={responsePrefix} onChange={(e) => setResponsePrefix(e.target.value)} placeholder="默认 🦞" className="text-[13px] h-9 w-32" />
+              <Label>回复前缀 (responsePrefix)</Label>
+              <Input value={responsePrefix} onChange={(e) => setResponsePrefix(e.target.value)} placeholder="默认 🦞" className="text-[13px] h-9 mt-1 shadow-sm w-32" />
+              <p className="text-[11px] text-muted-foreground mt-1.5">每条回复前的标识符，如 🧡 或 [AI]</p>
             </div>
             <div>
-              <Label>确认反应</Label>
-              <Input value={ackReaction} onChange={(e) => setAckReaction(e.target.value)} placeholder="默认 👀" className="text-[13px] h-9 w-32" />
+              <Label>确认反应 (ackReaction)</Label>
+              <Input value={ackReaction} onChange={(e) => setAckReaction(e.target.value)} placeholder="默认 👀" className="text-[13px] h-9 mt-1 shadow-sm w-32" />
+              <p className="text-[11px] text-muted-foreground mt-1.5">收到消息后立即给出的表情反应，默认为 identity.emoji 或 👀</p>
             </div>
           </div>
-          <p className="text-[11px] text-muted-foreground mt-1.5">回复前缀默认 🦞，确认反应默认 👀（来自 Emoji 标识）</p>
-        </section>
-      </>
+        </motion.section>
+      </div>
     );
   }
 
@@ -1243,77 +1477,96 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
 
   function renderSessionTab() {
     return (
-      <>
-        <section>
-          <Label>会话隔离模式</Label>
-          <Select value={dmScope} onChange={(e) => setDmScope(e.target.value)}>
-            <option value="main">main（所有 DM 共享主会话）</option>
-            <option value="per-peer">per-peer（按发送者跨通道隔离）</option>
-            <option value="per-channel-peer">per-channel-peer（按通道+发送者隔离）</option>
-            <option value="per-account-channel-peer">per-account-channel-peer（按账号+通道+发送者隔离）</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 main</p>
-        </section>
-
-        <section>
-          <Label>重置模式</Label>
-          <Select value={resetMode} onChange={(e) => setResetMode(e.target.value)}>
-            <option value="">未配置</option>
-            <option value="daily">daily（每日定时重置）</option>
-            <option value="idle">idle（空闲超时重置）</option>
-          </Select>
-          {resetMode === "daily" && (
-            <div className="mt-3">
-              <Label>每日重置时间（0-23 时）</Label>
-              <Input value={resetAtHour} onChange={(e) => setResetAtHour(e.target.value)} type="number" min={0} max={23} placeholder="4" className="text-[13px] h-9 w-24" />
-              <p className="text-[11px] text-muted-foreground mt-1">默认凌晨 4 点</p>
-            </div>
-          )}
-          {resetMode === "idle" && (
-            <div className="mt-3">
-              <Label>空闲重置时间（分钟）</Label>
-              <Input value={resetIdleMinutes} onChange={(e) => setResetIdleMinutes(e.target.value)} type="number" placeholder="60" className="text-[13px] h-9 w-24" />
-              <p className="text-[11px] text-muted-foreground mt-1">默认 60 分钟</p>
-            </div>
-          )}
-        </section>
-
-        <section>
-          <Label>重置指令</Label>
-          <div className="flex flex-wrap gap-1.5 mb-3">
-            {resetTriggers.map((t) => (
-              <TagChip key={t} label={t} onRemove={() => setResetTriggers((prev) => prev.filter((x) => x !== t))} />
-            ))}
+      <div className="flex flex-col gap-5">
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🔒 会话隔离 (Session Scope)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">控制不同用户的对话如何隔离，防止记忆串台。</p>
           </div>
-          <div className="flex gap-2">
-            <Input
-              value={newResetTrigger}
-              onChange={(e) => setNewResetTrigger(e.target.value)}
-              placeholder="如 /clear"
-              className="text-[13px] h-9 flex-1"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  const v = newResetTrigger.trim();
-                  if (v && !resetTriggers.includes(v)) {
-                    setResetTriggers((prev) => [...prev, v]);
-                    setNewResetTrigger("");
+          <div>
+            <Label className="text-[13px]">会话隔离策略 (dmScope)</Label>
+            <Select value={dmScope} onChange={(e) => setDmScope(e.target.value)} className="mt-1 shadow-sm">
+              <option value="main">main（所有用户共享一个会话）</option>
+              <option value="per-peer">per-peer（按发送者隔离）</option>
+              <option value="per-channel-peer">per-channel-peer（按渠道+发送者隔离，推荐）</option>
+              <option value="per-account-channel-peer">per-account-channel-peer（最严格隔离）</option>
+            </Select>
+            <p className="text-[11px] text-muted-foreground mt-1.5">个人使用选 main；多人共享建议选 per-channel-peer 或更高级别</p>
+          </div>
+        </motion.section>
+
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">⏰ 会话重置 (Session Reset)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">配置自动清空对话历史的规则，或通过命令手动重置。</p>
+          </div>
+
+          <div className="p-3 bg-muted/30 border border-border/40 rounded-xl mb-4">
+            <Label className="text-[13px]">自动重置模式 (reset.mode)</Label>
+            <Select value={resetMode} onChange={(e) => setResetMode(e.target.value)} className="mt-1 shadow-sm">
+              <option value="">不自动重置</option>
+              <option value="daily">daily（每天定时重置）</option>
+              <option value="idle">idle（空闲超时后重置）</option>
+            </Select>
+
+            {resetMode === "daily" && (
+              <div className="mt-3 pt-3 border-t border-border/40">
+                <Label>重置时间（小时，0-23）</Label>
+                <div className="flex items-center gap-2 mt-1">
+                  <Input value={resetAtHour} onChange={(e) => setResetAtHour(e.target.value)} type="number" min={0} max={23} placeholder="4" className="text-[13px] h-9 w-24 shadow-sm" />
+                  <span className="text-[12px] text-muted-foreground font-medium">点时执行重置</span>
+                </div>
+              </div>
+            )}
+            {resetMode === "idle" && (
+              <div className="mt-3 pt-3 border-t border-border/40">
+                <Label>空闲超时（分钟）</Label>
+                <div className="flex items-center gap-2 mt-1">
+                  <Input value={resetIdleMinutes} onChange={(e) => setResetIdleMinutes(e.target.value)} type="number" placeholder="60" className="text-[13px] h-9 w-24 shadow-sm" />
+                  <span className="text-[12px] text-muted-foreground font-medium">分钟无互动则自动重置</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <Label className="text-[13px]">手动重置触发词 (resetTriggers)</Label>
+            <div className="flex flex-wrap gap-1.5 mt-1.5 mb-2.5">
+              {resetTriggers.map((t) => (
+                <TagChip key={t} label={t} onRemove={() => setResetTriggers((prev) => prev.filter((x) => x !== t))} />
+              ))}
+              {resetTriggers.length === 0 && <span className="text-[12px] text-muted-foreground py-0.5 font-medium">未配置触发词</span>}
+            </div>
+            <div className="flex gap-2">
+              <Input
+                value={newResetTrigger}
+                onChange={(e) => setNewResetTrigger(e.target.value)}
+                placeholder="如 /clear，键入 Enter 立即录入"
+                className="text-[13px] h-9 flex-1 shadow-sm"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const v = newResetTrigger.trim();
+                    if (v && !resetTriggers.includes(v)) {
+                      setResetTriggers((prev) => [...prev, v]);
+                      setNewResetTrigger("");
+                    }
                   }
+                }}
+              />
+              <Button variant="outline" size="sm" onClick={() => {
+                const v = newResetTrigger.trim();
+                if (v && !resetTriggers.includes(v)) {
+                  setResetTriggers((prev) => [...prev, v]);
+                  setNewResetTrigger("");
                 }
-              }}
-            />
-            <Button variant="outline" size="sm" onClick={() => {
-              const v = newResetTrigger.trim();
-              if (v && !resetTriggers.includes(v)) {
-                setResetTriggers((prev) => [...prev, v]);
-                setNewResetTrigger("");
-              }
-            }} disabled={!newResetTrigger.trim()} className="h-9 px-3">
-              <Plus className="w-3.5 h-3.5 mr-1" /> 添加
-            </Button>
+              }} disabled={!newResetTrigger.trim()} className="h-9 px-4 shadow-sm">
+                <Plus className="w-4 h-4 mr-1.5" /> 添加
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground mt-1.5 leading-relaxed">发送这些命令会清空当前会话历史，开始全新对话。建议添加 "/new" 或 "/reset"</p>
           </div>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 /new 和 /reset</p>
-        </section>
-      </>
+        </motion.section>
+      </div>
     );
   }
 
@@ -1321,43 +1574,55 @@ export default function ConfigPanel({ resource, onConfigChange, configPath }: Co
 
   function renderLoggingTab() {
     return (
-      <>
-        <section>
-          <Label>日志级别</Label>
-          <Select value={logLevel} onChange={(e) => setLogLevel(e.target.value)}>
-            <option value="debug">debug</option>
-            <option value="info">info</option>
-            <option value="warn">warn</option>
-            <option value="error">error</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 info</p>
-        </section>
+      <div className="flex flex-col gap-5">
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">📋 日志配置 (Logging)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">控制控制台和文件日志的输出级别与存储位置。</p>
+          </div>
 
-        <section>
-          <Label>日志文件路径</Label>
-          <Input value={logFile} onChange={(e) => setLogFile(e.target.value)} placeholder="留空使用默认路径 /tmp/openclaw/openclaw-YYYY-MM-DD.log" className="text-[13px] h-9" />
-        </section>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label>控制台日志级别 (consoleLevel)</Label>
+              <Select value={consoleLevel} onChange={(e) => setConsoleLevel(e.target.value)} className="mt-1 shadow-sm">
+                <option value="debug">debug（详细调试信息）</option>
+                <option value="info">info（常规信息，默认）</option>
+                <option value="warn">warn（仅警告）</option>
+                <option value="error">error（仅错误）</option>
+              </Select>
+              <p className="text-[11px] text-muted-foreground mt-1.5">默认 info。使用 CLI --verbose 开关时会强制切换到 debug</p>
+            </div>
+            <div>
+              <Label>文件日志级别 (logging.level)</Label>
+              <Select value={logLevel} onChange={(e) => setLogLevel(e.target.value)} className="mt-1 shadow-sm">
+                <option value="debug">debug</option>
+                <option value="info">info</option>
+                <option value="warn">warn</option>
+                <option value="error">error</option>
+              </Select>
+              <p className="text-[11px] text-muted-foreground mt-1.5">写入日志文件的记录级别</p>
+            </div>
+          </div>
 
-        <section>
-          <Label>控制台日志级别</Label>
-          <Select value={consoleLevel} onChange={(e) => setConsoleLevel(e.target.value)}>
-            <option value="debug">debug</option>
-            <option value="info">info</option>
-            <option value="warn">warn</option>
-            <option value="error">error</option>
-          </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 info，使用 --verbose 时自动升级为 debug</p>
-        </section>
+          <div className="mt-5 pt-4 border-t border-border/40">
+            <Label>日志文件路径 (logging.file)</Label>
+            <Input value={logFile} onChange={(e) => setLogFile(e.target.value)} placeholder="留空则使用默认路径: /tmp/openclaw/openclaw-YYYY-MM-DD.log" className="text-[13px] h-9 mt-1 shadow-sm font-mono tracking-tight" />
+          </div>
+        </motion.section>
 
-        <section>
-          <Label>敏感信息脱敏</Label>
-          <Select value={redactSensitive} onChange={(e) => setRedactSensitive(e.target.value)}>
+        <motion.section variants={itemVariants} className="p-5 bg-card/60 backdrop-blur-xl border border-border/50 shadow-sm rounded-2xl card-hover relative overflow-hidden group">
+          <div className="mb-4">
+            <h3 className="text-[14px] font-semibold text-foreground flex items-center gap-2">🛡️ 敏感信息脱敏 (Redact)</h3>
+            <p className="text-[12px] text-muted-foreground mt-1">防止日志中泄露 API 密钥、密码等敏感信息。</p>
+          </div>
+          <Label>脱敏模式 (redactSensitive)</Label>
+          <Select value={redactSensitive} onChange={(e) => setRedactSensitive(e.target.value)} className="mt-1 max-w-sm shadow-sm">
             <option value="off">off（不脱敏）</option>
-            <option value="tools">tools（工具输出脱敏）</option>
+            <option value="tools">tools（脱敏工具返回的敏感内容）</option>
           </Select>
-          <p className="text-[11px] text-muted-foreground mt-1.5">默认 tools</p>
-        </section>
-      </>
+          <p className="text-[11px] text-muted-foreground mt-1.5 leading-relaxed max-w-xl">开启 tools 后，系统会自动检测并将日志中可能包含密钥的内容替换为 ***。生产环境建议开启。</p>
+        </motion.section>
+      </div>
     );
   }
 }

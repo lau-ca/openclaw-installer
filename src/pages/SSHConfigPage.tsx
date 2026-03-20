@@ -36,11 +36,6 @@ export default function SSHConfigPage() {
     setTestStatus("testing");
     setTestMessage("");
     try {
-      if (!(window as any).__TAURI_INTERNALS__) {
-        throw new Error(
-          "未检测到 Tauri 运行时，请确保在 Tauri 窗口中运行应用（使用 npm run tauri dev），而非浏览器中直接访问"
-        );
-      }
       const result = await invoke<string>("test_ssh_connection", {
         host: sshConfig.host,
         port: sshConfig.port,
@@ -62,11 +57,6 @@ export default function SSHConfigPage() {
     setTestStatus("idle");
     setTestMessage("");
     try {
-      if (!(window as any).__TAURI_INTERNALS__) {
-        throw new Error(
-          "未检测到 Tauri 运行时，请确保在 Tauri 窗口中运行应用（使用 npm run tauri dev），而非浏览器中直接访问"
-        );
-      }
       await invoke<string>("test_ssh_connection", {
         host: sshConfig.host,
         port: sshConfig.port,
@@ -163,7 +153,7 @@ export default function SSHConfigPage() {
             <button
               type="button"
               onClick={() => setShowPassword(!showPassword)}
-              className="absolute right-0 top-0 h-full px-3 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+              className="absolute right-0 top-0 h-full px-3 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
             >
               {showPassword ? (
                 <EyeOff className="w-4 h-4" />

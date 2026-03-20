@@ -1,13 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useWizardStore } from "@/stores/wizard-store";
-import { WizardStep } from "@/types/app";
 import { Button } from "@/components/ui/button";
 import { motion } from "framer-motion";
 import { fadeIn } from "@/lib/animations";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { addResource } from "@/lib/db";
+import { useSaveAndStart } from "@/lib/hooks";
 import {
   ArrowLeft,
   Loader2,
@@ -18,13 +17,13 @@ import {
 type OverallStatus = "idle" | "running" | "success" | "error";
 
 export default function InstallPage() {
-  const { installTarget, sshConfig, prevStep, goToStep } = useWizardStore();
+  const { installTarget, sshConfig, prevStep } = useWizardStore();
   const isRemote = installTarget === "remote";
+  const { saving: savingStart, saveAndStart: handleStartUse } = useSaveAndStart();
 
   const [logs, setLogs] = useState<string[]>([]);
   const [overallStatus, setOverallStatus] = useState<OverallStatus>("running");
   const [resultMessage, setResultMessage] = useState("");
-  const [savingStart, setSavingStart] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
   const startedRef = useRef(false);
 
@@ -60,7 +59,6 @@ export default function InstallPage() {
           port: sshConfig.port,
           username: sshConfig.username,
           password: sshConfig.password,
-          installPath: "",
         });
       } else {
         result = await invoke<string>("install_local");
@@ -79,27 +77,6 @@ export default function InstallPage() {
     setLogs([]);
     setResultMessage("");
     runInstall();
-  }
-
-  async function handleStartUse() {
-    setSavingStart(true);
-    try {
-      await addResource({
-        name: "默认资源",
-        type: installTarget === "remote" ? "remote" : "local",
-        ...(installTarget === "remote" ? {
-          host: sshConfig.host,
-          port: sshConfig.port,
-          username: sshConfig.username,
-          password: sshConfig.password,
-        } : {}),
-      });
-    } catch (err) {
-      console.error("保存设置失败:", err);
-    } finally {
-      setSavingStart(false);
-      goToStep(WizardStep.START);
-    }
   }
 
   return (

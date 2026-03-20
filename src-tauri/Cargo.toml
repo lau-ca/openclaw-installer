@@ -31,6 +31,5 @@ aes-gcm = "0.10"
 rand = "0.8"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 sha2 = "0.10"
-hex = "0.4"
 base64 = "0.22"
-
+zeroize = "1"

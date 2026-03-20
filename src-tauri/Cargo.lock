@@ -2666,7 +2666,6 @@ version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
- "hex",
  "openssl",
  "pbkdf2",
  "rand 0.8.5",
@@ -2680,6 +2679,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-sql",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 
 echo "=== OpenClaw HTTPS 配置脚本 ==="
 
@@ -57,26 +57,60 @@ mkdir -p "$HOME/.openclaw/bin"
 CADDY_VER="2.11.2"
 
 download_caddy() {
-  echo "⬇️  正在下载 Caddy v${CADDY_VER} (${CADDY_ARCH})... From https://github.com/caddyserver/caddy/releases/tag/v2.11.2"
+  echo "⬇️  正在下载 Caddy v${CADDY_VER} (${CADDY_ARCH})..."
 
-  # 优先使用 GitHub 镜像下载（国内可访问）
-  GITHUB_MIRROR="${GITHUB_MIRROR:-https://gh-proxy.com}"
   CADDY_TAR="${CADDY_TMP}.tar.gz"
-  CADDY_URL="${GITHUB_MIRROR}/https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_linux_${CADDY_ARCH}.tar.gz"
+  local downloaded=false
+  local CADDY_RELEASE_FILE="caddy_${CADDY_VER}_linux_${CADDY_ARCH}.tar.gz"
+  local GITHUB_RELEASE_URL="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/${CADDY_RELEASE_FILE}"
 
-  if ! curl -fL "$CADDY_URL" -o "$CADDY_TAR" --connect-timeout 30; then
-    echo "⚠️  镜像下载失败，尝试 Caddy 官方 API..."
-    # 备用：Caddy 官方下载 API（Cloudflare CDN，直接返回裸二进制）
-    CADDY_URL="https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}&version=v${CADDY_VER}"
-    curl -fL "$CADDY_URL" -o "$CADDY_TMP" --connect-timeout 30
+  # Mirror list: prioritize China-friendly CDNs, then proxies, then direct
+  local MIRROR_URLS=(
+    "https://cdn.npmmirror.com/binaries/caddy/v${CADDY_VER}/${CADDY_RELEASE_FILE}"
+    "https://ghfast.top/${GITHUB_RELEASE_URL}"
+    "${GITHUB_MIRROR:-https://gh-proxy.com}/${GITHUB_RELEASE_URL}"
+    "${GITHUB_RELEASE_URL}"
+  )
+
+  # Try each mirror for tar.gz download
+  local idx=0
+  for mirror_url in "${MIRROR_URLS[@]}"; do
+    idx=$((idx + 1))
+    echo "  [${idx}/${#MIRROR_URLS[@]}] 尝试: ${mirror_url}"
+    rm -f "$CADDY_TAR" 2>/dev/null
+    if curl -fL "$mirror_url" -o "$CADDY_TAR" --connect-timeout 15 --max-time 120 2>&1; then
+      EXTRACT_DIR=$(mktemp -d)
+      if tar -xzf "$CADDY_TAR" -C "$EXTRACT_DIR" caddy 2>/dev/null; then
+        mv -f "$EXTRACT_DIR/caddy" "$CADDY_TMP" && downloaded=true
+      else
+        echo "⚠️  tar 解压失败，文件可能无效"
+      fi
+      rm -rf "$EXTRACT_DIR" "$CADDY_TAR" 2>/dev/null
+      if [ "$downloaded" = true ]; then
+        break
+      fi
+    else
+      echo "⚠️  下载失败"
+      rm -f "$CADDY_TAR" 2>/dev/null
+    fi
+  done
+
+  # Fallback: Caddy 官方 API（裸二进制，Cloudflare CDN）
+  if [ "$downloaded" = false ]; then
+    local CADDY_API_URL="https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}&version=v${CADDY_VER}"
+    echo "  尝试 Caddy 官方 API: ${CADDY_API_URL}"
+    if curl -fL "$CADDY_API_URL" -o "$CADDY_TMP" --connect-timeout 15 --max-time 120 2>&1; then
+      downloaded=true
+    else
+      echo "⚠️  Caddy 官方 API 下载失败"
+      rm -f "$CADDY_TMP" 2>/dev/null
+    fi
   fi
 
-  # 如果下载的是 tar.gz，需要解压
-  if [ -f "$CADDY_TAR" ]; then
-    EXTRACT_DIR=$(mktemp -d)
-    tar -xzf "$CADDY_TAR" -C "$EXTRACT_DIR" caddy
-    mv -f "$EXTRACT_DIR/caddy" "$CADDY_TMP"
-    rm -rf "$EXTRACT_DIR" "$CADDY_TAR"
+  # 最终检查
+  if [ "$downloaded" = false ] || [ ! -f "$CADDY_TMP" ]; then
+    echo "❌ Caddy 下载失败，所有下载方式均未成功，请检查网络连接"
+    exit 1
   fi
 
   chmod +x "$CADDY_TMP"
@@ -149,15 +183,13 @@ cat > "$CADDYFILE" <<EOF
 
 https://${LAN_IP}:${HTTPS_PORT} {
     tls internal
-    reverse_proxy localhost:${OPENCLAW_PORT} {
-        header_up X-Forwarded-User "admin@local"
-    }
+    reverse_proxy localhost:${OPENCLAW_PORT}
 }
 EOF
 echo "✅ Caddyfile 已写入"
 
 # -------- 5. 配置 systemd 开机自启 --------
-# 注意：OpenClaw 的 trusted-proxy 认证配置由安装器平台 ConfigPanel 管理
+# 注意：Caddy 仅做 TLS 终止 + 反向代理，OpenClaw 使用 token 认证（由 ConfigPanel 管理）
 SERVICE_FILE="/etc/systemd/system/openclaw-caddy.service"
 
 do_sudo tee "$SERVICE_FILE" > /dev/null <<EOF

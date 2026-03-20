@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import "./index.css";
 import StepIndicator from "@/components/StepIndicator";
 import WizardShell from "@/components/WizardShell";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import { useWizardStore } from "@/stores/wizard-store";
 import { WizardStep } from "@/types/app";
 import { hasResources } from "@/lib/db";
@@ -40,7 +41,9 @@ function App() {
       <div className="h-8 shrink-0" data-tauri-drag-region />
       {!isStartPage && <StepIndicator />}
       <main className="flex-1 px-8 pb-6 pt-4 overflow-auto">
-        <WizardShell />
+        <ErrorBoundary>
+          <WizardShell />
+        </ErrorBoundary>
       </main>
     </div>
   );

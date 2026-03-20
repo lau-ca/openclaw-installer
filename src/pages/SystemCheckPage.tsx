@@ -1,13 +1,12 @@
 import { useEffect, useState, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import { useWizardStore } from "@/stores/wizard-store";
-import { WizardStep } from "@/types/app";
 import { Button } from "@/components/ui/button";
 import type { CheckStatus } from "@/types/app";
 import { motion } from "framer-motion";
 import { fadeIn, staggerChild } from "@/lib/animations";
 import { invoke } from "@tauri-apps/api/core";
-import { addResource } from "@/lib/db";
+import { useSaveAndStart } from "@/lib/hooks";
 import {
   ArrowLeft,
   ArrowRight,
@@ -43,11 +42,11 @@ const statusColor: Record<CheckStatus, string> = {
 };
 
 export default function SystemCheckPage() {
-  const { installTarget, sshConfig, prevStep, nextStep, goToStep } = useWizardStore();
+  const { installTarget, sshConfig, prevStep, nextStep } = useWizardStore();
   const [checks, setChecks] = useState<CheckItemUI[]>([]);
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(false);
-  const [savingStart, setSavingStart] = useState(false);
+  const { saving: savingStart, saveAndStart: handleStartUse } = useSaveAndStart();
 
   const isRemote = installTarget === "remote";
 
@@ -109,27 +108,6 @@ export default function SystemCheckPage() {
   const openclawInstalled = checks.some(
     (c) => c.id === "openclaw" && c.status === "warn"
   );
-
-  async function handleStartUse() {
-    setSavingStart(true);
-    try {
-      await addResource({
-        name: "默认资源",
-        type: installTarget === "remote" ? "remote" : "local",
-        ...(installTarget === "remote" ? {
-          host: sshConfig.host,
-          port: sshConfig.port,
-          username: sshConfig.username,
-          password: sshConfig.password,
-        } : {}),
-      });
-    } catch (err) {
-      console.error("保存设置失败:", err);
-    } finally {
-      setSavingStart(false);
-      goToStep(WizardStep.START);
-    }
-  }
 
   return (
     <div className="flex flex-col h-full max-w-2xl mx-auto w-full">

@@ -132,3 +132,11 @@ export async function deleteResource(id: number) {
   await db.execute(`DELETE FROM resources WHERE id = $1`, [id]);
 }
 
+/**
+ * 清空 resources 表全部记录
+ */
+export async function clearAllResources() {
+  const db = await getDb();
+  await db.execute(`DELETE FROM resources`);
+}
+

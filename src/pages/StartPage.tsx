@@ -9,11 +9,13 @@ import { useWizardStore } from "@/stores/wizard-store";
 import { WizardStep } from "@/types/app";
 import ConfigPanel, { checkConfigStatus, type ConfigStatus } from "@/pages/ConfigPanel";
 import ControlPanel from "@/pages/ControlPanel";
+import CommunicationPanel from "@/pages/CommunicationPanel";
 import { Toast } from "@/components/ui/alert-dialog";
 import {
   Play,
   Puzzle,
   Settings,
+  MessageCircle,
   Construction,
   Server,
   Monitor,
@@ -34,6 +36,7 @@ interface NavItem {
 const navItems: NavItem[] = [
   { id: "dashboard", label: "控制台", icon: Play },
   { id: "skills", label: "技能", icon: Puzzle },
+  { id: "communication", label: "通讯", icon: MessageCircle },
   { id: "config", label: "配置", icon: Settings },
 ];
 
@@ -292,6 +295,9 @@ export default function StartPage() {
       return (
         <ConfigPanel resource={resource} onConfigChange={handleConfigChange} configPath={configPath} />
       );
+    }
+    if (activeNav === "communication") {
+      return <CommunicationPanel resource={resource} />;
     }
     // 其他 tab 显示占位
     return (

@@ -6,7 +6,8 @@ import { Input } from "@/components/ui/input";
 import type { InstallTarget } from "@/types/app";
 import { motion, AnimatePresence } from "framer-motion";
 import { fadeIn, staggerChild, springScale } from "@/lib/animations";
-import { invoke } from "@tauri-apps/api/core";
+import { safeInvoke } from "@/lib/tauri";
+import { useToast, useSSHTest } from "@/lib/hooks";
 import { Toast } from "@/components/ui/alert-dialog";
 import {
   Monitor,
@@ -53,8 +54,6 @@ const targets: TargetOption[] = [
   },
 ];
 
-type TestStatus = "idle" | "testing" | "success" | "error";
-
 export default function TargetSelectPage() {
   const {
     installTarget,
@@ -65,19 +64,12 @@ export default function TargetSelectPage() {
     nextStep,
   } = useWizardStore();
 
-  const [testStatus, setTestStatus] = useState<TestStatus>("idle");
-  const [toastOpen, setToastOpen] = useState(false);
-  const [toastMessage, setToastMessage] = useState("");
-  const [toastKind, setToastKind] = useState<"success" | "error">("error");
+  const { toast, showToast, closeToast } = useToast();
+  const { testStatus, canTest: canTestSSH, runTest } = useSSHTest(sshConfig, setSSHTested);
   const [showPassword, setShowPassword] = useState(false);
   const [isNextLoading, setIsNextLoading] = useState(false);
 
   const isRemote = installTarget === "remote";
-
-  const canTestSSH =
-    sshConfig.host.trim() !== "" &&
-    sshConfig.username.trim() !== "" &&
-    sshConfig.password.trim() !== "";
 
   const canProceed = installTarget
     ? isRemote
@@ -86,32 +78,12 @@ export default function TargetSelectPage() {
     : false;
 
   async function handleTestSSH() {
-    setTestStatus("testing");
-    try {
-      if (!(window as any).__TAURI_INTERNALS__) {
-        throw new Error(
-          "未检测到 Tauri 运行时，请确保在 Tauri 窗口中运行应用"
-        );
-      }
-      const result = await invoke<string>("test_ssh_connection", {
-        host: sshConfig.host,
-        port: sshConfig.port,
-        username: sshConfig.username,
-        password: sshConfig.password,
-      });
-      setTestStatus("success");
-      setSSHTested(true);
-      setToastKind("success");
-      setToastMessage(result);
-      setToastOpen(true);
-    } catch (err) {
-      setTestStatus("error");
-      const errMsg = err instanceof Error ? err.message : String(err);
-      setSSHTested(false);
-      setToastKind("error");
-      setToastMessage(errMsg);
-      setToastOpen(true);
-    }
+    const result = await runTest();
+    showToast(
+      result.success ? "success" : "error",
+      result.message,
+      result.success ? "SSH 连接成功" : "SSH 连接失败",
+    );
   }
 
   async function handleNext() {
@@ -124,12 +96,7 @@ export default function TargetSelectPage() {
 
     setIsNextLoading(true);
     try {
-      if (!(window as any).__TAURI_INTERNALS__) {
-        throw new Error(
-          "未检测到 Tauri 运行时，请确保在 Tauri 窗口中运行应用"
-        );
-      }
-      await invoke<string>("test_ssh_connection", {
+      await safeInvoke<string>("test_ssh_connection", {
         host: sshConfig.host,
         port: sshConfig.port,
         username: sshConfig.username,
@@ -139,9 +106,7 @@ export default function TargetSelectPage() {
       nextStep();
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      setToastKind("error");
-      setToastMessage(errMsg);
-      setToastOpen(true);
+      showToast("error", errMsg, "SSH 连接失败");
       setSSHTested(false);
     } finally {
       setIsNextLoading(false);
@@ -350,11 +315,11 @@ export default function TargetSelectPage() {
         </Button>
       </motion.div>
       <Toast
-        open={toastOpen}
-        onClose={() => setToastOpen(false)}
-        title={toastKind === "success" ? "SSH 连接成功" : "SSH 连接失败"}
-        message={toastMessage}
-        kind={toastKind}
+        open={toast.open}
+        onClose={closeToast}
+        title={toast.title}
+        message={toast.message}
+        kind={toast.kind}
       />
     </div>
   );
