@@ -75,10 +75,34 @@ pub fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
 /// 构建包含所有已知 OpenClaw 安装目录的 PATH 前缀。
 /// macOS GUI 应用不继承用户 shell 的 PATH，需要显式补全。
 pub fn openclaw_path_prefix() -> String {
-    "/opt/homebrew/bin:/opt/homebrew/sbin\
-     :/usr/local/bin:/usr/local/sbin\
-     :$HOME/.local/node/bin:$HOME/.local/bin\
-     :$HOME/.npm-global/bin".to_string()
+    // 动态获取当前 npm 全局路径
+    let npm_prefix = std::process::Command::new("npm")
+        .args(["config", "get", "prefix"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let nvm_bin = if npm_prefix.contains(".nvm") {
+        format!("{}:bin", npm_prefix)
+    } else {
+        String::new()
+    };
+
+    let paths = vec![
+        "/opt/homebrew/bin:/opt/homebrew/sbin",
+        "/usr/local/bin:/usr/local/sbin",
+        "$HOME/.local/node/bin:$HOME/.local/bin",
+        "$HOME/.npm-global/bin",
+    ];
+
+    let all_paths: Vec<&str> = paths.iter()
+        .map(|s| *s)
+        .chain(if !nvm_bin.is_empty() { vec![nvm_bin.as_str()] } else { vec![] })
+        .collect();
+
+    all_paths.join(":")
 }
 
 /// Windows: 从注册表刷新 PATH 后执行 openclaw 命令的 PowerShell 前缀。
