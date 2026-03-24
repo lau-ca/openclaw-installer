@@ -1,9 +1,9 @@
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
-use crate::helpers::{
-    extract_between_markers, openclaw_path_prefix, strip_ansi,
-    REMOTE_PATH_SETUP,
-};
+use crate::helpers::{strip_ansi, REMOTE_PATH_SETUP};
+#[cfg(unix)]
+use crate::helpers::{extract_between_markers, openclaw_path_prefix};
 #[cfg(target_os = "windows")]
 use crate::helpers::{run_cmd, win_refresh_path_prefix};
 use crate::ssh::{create_ssh_session, ssh_exec};

@@ -3,9 +3,11 @@ use std::process::{Command, Stdio};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
 use crate::helpers::{
-    emit_log, openclaw_path_prefix, poll_result, spawn_blocking_install,
+    emit_log, poll_result, spawn_blocking_install,
     REMOTE_PATH_SETUP,
 };
+#[cfg(unix)]
+use crate::helpers::openclaw_path_prefix;
 use crate::ssh::{create_ssh_session, ssh_exec, ssh_stream_lines};
 
 /// Embedded install scripts (compiled into the binary)

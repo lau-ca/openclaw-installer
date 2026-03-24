@@ -1,7 +1,7 @@
 use crate::cli::detect_openclaw_version;
-use crate::helpers::{
-    parse_disk_free_mb, parse_section, run_cmd, CheckResult,
-};
+use crate::helpers::{parse_section, run_cmd, CheckResult};
+#[cfg(not(target_os = "windows"))]
+use crate::helpers::parse_disk_free_mb;
 use crate::ssh::{create_ssh_session, ssh_exec};
 
 // ── Platform-specific local metrics ────────────────

@@ -5,9 +5,9 @@ use zeroize::Zeroizing;
 
 use crate::cli::run_openclaw;
 use crate::config::{sanitize_local_config, sanitize_remote_config};
-use crate::helpers::{
-    emit_gateway_log, openclaw_path_prefix, REMOTE_PATH_SETUP,
-};
+use crate::helpers::{emit_gateway_log, REMOTE_PATH_SETUP};
+#[cfg(unix)]
+use crate::helpers::openclaw_path_prefix;
 #[cfg(target_os = "windows")]
 use crate::helpers::win_refresh_path_prefix;
 use crate::ssh::{create_ssh_session, ssh_exec, ssh_stream_lines};
